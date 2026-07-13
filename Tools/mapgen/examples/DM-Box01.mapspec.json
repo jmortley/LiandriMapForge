@@ -13,6 +13,10 @@
     { "type": "health_medium", "location": [0, 0, 64] },
     { "type": "shieldbelt", "location": [1536, 0, 64] }
   ],
+  "meshes": [
+    { "mesh": "cylinder", "location": [0, 512, 256], "scale": [1.5, 1.5, 5.0] },
+    { "mesh": "cube", "location": [-512, 512, 128], "scale": [2.0, 2.0, 2.5] }
+  ],
   "playerStarts": [
     { "location": [-768, -768, 96], "yaw": 45 },
     { "location": [768, 768, 96], "yaw": 225 }

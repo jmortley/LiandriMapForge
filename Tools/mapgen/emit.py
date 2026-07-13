@@ -28,6 +28,32 @@ PICKUPS = {
     "shieldbelt":      ("Armor_ShieldBelt_C","/Game/RestrictedAssets/Pickups/Armor/Armor_ShieldBelt", "Capsule"),
 }
 
+# ---- static-mesh kit (mined from DM-Solo). Alias -> /Game path. ----
+# These are the ShellResources blockout primitives real UT4 whiteboxes use.
+MESHES = {
+    "cube":       "/Game/RestrictedAssets/Environments/ShellResources/Meshes/Generic/Shape_Cube.Shape_Cube",
+    "cylinder":   "/Game/RestrictedAssets/Environments/ShellResources/Meshes/Generic/Shape_Cylinder.Shape_Cylinder",
+    "sheet":      "/Game/RestrictedAssets/Environments/ShellResources/Meshes/Generic/SM_Sheet_500.SM_Sheet_500",
+    "sheet_tess": "/Game/RestrictedAssets/Environments/ShellResources/Meshes/SM_Sheet_500_tesselated.SM_Sheet_500_tesselated",
+    "gate":       "/Game/RestrictedAssets/Environments/ShellResources/Meshes/S_Gate.S_Gate",
+    "techlift":   "/Game/RestrictedAssets/Blueprints/Lift/Meshes/SM_TechLift_Tall.SM_TechLift_Tall",
+}
+
+# ---- material palette (mined from DM-Solo). Real ShellResources materials, so
+# generated surfaces read as UT4 instead of default checker. ----
+_M = "/Game/RestrictedAssets/Environments/ShellResources/Materials/"
+MAT_FLOOR = _M + "Industrial/M_Shell_IND_Ribbed.M_Shell_IND_Ribbed"
+MAT_WALL  = _M + "Tech/M_Shell_City_Wall_B.M_Shell_City_Wall_B"  # 696 uses in DM-Solo
+MAT_CEIL  = _M + "Tech/M_Shell_City_Wall_A.M_Shell_City_Wall_A"
+
+def brush_material(name, defaults):
+    """Pick a material by the brush's role (floor/ceiling/wall). Spec defaults win."""
+    if name.startswith("floor"):
+        return defaults.get("floorMaterial") or MAT_FLOOR
+    if name.startswith("ceil"):
+        return defaults.get("ceilingMaterial") or MAT_CEIL
+    return defaults.get("wallMaterial") or MAT_WALL
+
 # ---- formatting -------------------------------------------------------------
 
 def v(x, y, z):
@@ -238,6 +264,33 @@ def pickup(name, ptype, loc):
         "      End Actor",
     ])
 
+def static_mesh_actor(name, mesh, loc, rot=(0, 0, 0), scale=(1, 1, 1), material=None):
+    # Format verified against DM-Solo's StaticMeshActor blocks. `mesh` = alias or /Game path.
+    path = MESHES.get(mesh, mesh)
+    x, y, z = loc
+    pitch, yaw, roll = rot
+    sx, sy, sz = scale
+    lines = [
+        "      Begin Actor Class=StaticMeshActor Name=%s Archetype=StaticMeshActor'/Script/Engine.Default__StaticMeshActor'" % name,
+        '         Begin Object Class=StaticMeshComponent Name="StaticMeshComponent0" Archetype=StaticMeshComponent\'Default__StaticMeshActor:StaticMeshComponent0\'',
+        "         End Object",
+        '         Begin Object Name="StaticMeshComponent0"',
+        "            StaticMesh=StaticMesh'%s'" % path,
+    ]
+    if material:
+        lines.append("            OverrideMaterials(0)=Material'%s'" % material)
+    lines += [
+        "            RelativeLocation=%s" % p(x, y, z),
+        "            RelativeRotation=(Pitch=%.6f,Yaw=%.6f,Roll=%.6f)" % (pitch, yaw, roll),
+        "            RelativeScale3D=(X=%.6f,Y=%.6f,Z=%.6f)" % (sx, sy, sz),
+        "         End Object",
+        "         StaticMeshComponent=StaticMeshComponent0",
+        "         RootComponent=StaticMeshComponent0",
+        '         ActorLabel="%s"' % name,
+        "      End Actor",
+    ]
+    return "\n".join(lines)
+
 # ---- assembly ---------------------------------------------------------------
 
 def _defaults(spec):
@@ -247,14 +300,14 @@ def _defaults(spec):
 
 def emit(spec, actors=True):
     d = _defaults(spec)
-    tex = spec.get("defaults", {}).get("wallMaterial") or None
+    dm = spec.get("defaults", {})
     body = []
     for room in spec.get("rooms", []):
         for (name, mn, mx) in room_boxes(room, d, spec.get("doorways", [])):
-            body.append(box_brush(name, mn, mx, tex))
+            body.append(box_brush(name, mn, mx, brush_material(name, dm)))
     # raw additive boxes -- freeform tracing of an arbitrary floorplan
     for b in spec.get("brushes", []):
-        body.append(box_brush(b["name"], b["min"], b["max"], b.get("material") or tex))
+        body.append(box_brush(b["name"], b["min"], b["max"], b.get("material") or brush_material(b["name"], dm)))
     if actors:
         for i, ps in enumerate(spec.get("playerStarts", [])):
             body.append(player_start("UTPlayerStart_%d" % i, ps["location"], ps.get("yaw", 0)))
@@ -270,6 +323,10 @@ def emit(spec, actors=True):
                             lt.get("intensity", 5000), lt.get("radius", 1024)))
         for i, pk in enumerate(spec.get("pickups", [])):
             body.append(pickup("Pickup_%d" % i, pk["type"], pk["location"]))
+        for i, m in enumerate(spec.get("meshes", [])):
+            body.append(static_mesh_actor("SM_%d" % i, m["mesh"], m["location"],
+                        tuple(m.get("rotation", [0, 0, 0])), tuple(m.get("scale", [1, 1, 1])),
+                        m.get("material")))
     return "Begin Map\n   Begin Level\n" + "\n".join(body) + "\n   End Level\nEnd Map\n"
 
 def emit_smoke_cube():
@@ -288,7 +345,7 @@ def main():
 
     d = _defaults(spec)
     nbrush = sum(len(room_boxes(r, d, spec.get("doorways", []))) for r in spec.get("rooms", [])) + len(spec.get("brushes", []))
-    nact = len(spec.get("playerStarts", [])) + len(spec.get("lights", [])) + len(spec.get("pickups", []))
+    nact = len(spec.get("playerStarts", [])) + len(spec.get("lights", [])) + len(spec.get("pickups", [])) + len(spec.get("meshes", []))
 
     outputs = {
         "%s.t3d" % name: emit(spec, actors=True),

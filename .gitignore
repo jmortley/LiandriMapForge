@@ -1,6 +1,10 @@
 # Generated T3D (regenerate with emit.py)
 Tools/mapgen/out/
 
+# Large real-map T3D exports — reference only, re-exportable from the editor
+Tools/mapgen/capture/*.t3d
+!Tools/mapgen/capture/ground-truth.t3d
+
 # Python
 __pycache__/
 *.pyc
