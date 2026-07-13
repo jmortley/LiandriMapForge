@@ -1,7 +1,6 @@
 # LiandriMapForge
 
-AI-authored maps for **UnrealTournament (UE4 4.15 fork)**. What Cold-M did in the
-UT2004 editor — point an LLM at the game, get a playable map — but for UT4, seeded
+AI-authored maps for **UnrealTournament (UE4 4.15 fork)**. Point an LLM at the game, get a playable map — but for UT4, seeded
 by the [ElimPlus map layouts](https://ut4stats.com/elimplus_maps).
 
 > Standalone **editor-only** plugin, its own repo (sibling to NetcodePlus under
