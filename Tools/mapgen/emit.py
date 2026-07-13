@@ -359,7 +359,10 @@ def _defaults(spec):
     d.update(spec.get("defaults", {}))
     return d
 
-def emit(spec, actors=True):
+def emit(spec, actors=True, loaders=True):
+    """Compile a MapSpec to T3D. `loaders=False` drops the material-preloader
+    meshes -- correct when importing through the editor bridge, which preloads
+    assets for real (preload_assets) instead of tricking the paste resolver."""
     d = _defaults(spec)
     dm = spec.get("defaults", {})
     body = []

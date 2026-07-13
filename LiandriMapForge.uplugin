@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1",
+  "FriendlyName": "LiandriMapForge",
+  "Description": "AI map authoring for UT4: editor-only JSON-lines TCP bridge exposing UnrealEd's T3D import, build, save, and BSP surface machinery to the MapForge MCP proxy.",
+  "Category": "Editor",
+  "CreatedBy": "phantaci",
+  "CreatedByURL": "https://github.com/jmortley/LiandriMapForge",
+  "EnabledByDefault": true,
+  "Modules": [
+    {
+      "Name": "MapForgeBridge",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "WhitelistPlatforms": [ "Win64" ]
+    }
+  ]
+}
