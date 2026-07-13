@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://netcodeplus.ut4/mapspec.schema.json",
+  "title": "UT4 MapSpec v0",
+  "description": "Compact, LLM-authorable description of a UT4 arena. Compiled to T3D and imported into a .umap. v0 targets boxy arenas extruded from a 2D layout (e.g. an ElimPlus top-down icon). Coordinate system: Unreal units (~1cm), right-handed, +X forward / +Y right / +Z up. Ground plane is z=0.",
+  "type": "object",
+  "required": ["name", "rooms", "playerStarts"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Map asset name, e.g. DM-Claude01. Becomes the .umap filename."
+    },
+    "gametype": {
+      "type": "string",
+      "enum": ["DM", "TDM", "CTF", "Duel", "ElimPlus"],
+      "default": "DM"
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Fallback dimensions/materials applied when a room/wall omits them. All tunable; calibrate against real UT4 movement (jump height, doorway clearance) after first playtest.",
+      "properties": {
+        "wallHeight": { "type": "number", "default": 512 },
+        "wallThickness": { "type": "number", "default": 32 },
+        "floorThickness": { "type": "number", "default": 32 },
+        "wallMaterial": { "type": "string", "description": "Material path, e.g. /Game/RestrictedAssets/.../M_Wall. Empty = editor default." },
+        "floorMaterial": { "type": "string" },
+        "ceilingMaterial": { "type": "string" }
+      }
+    },
+    "rooms": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "min", "max"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "Unique room id, referenced by doorways." },
+          "min": { "$ref": "#/$defs/vec3", "description": "Interior AABB min [x,y,z]; z is the floor level." },
+          "max": { "$ref": "#/$defs/vec3", "description": "Interior AABB max [x,y,z]; z is the ceiling level." },
+          "floor": { "type": "boolean", "default": true },
+          "ceiling": { "type": "boolean", "default": true },
+          "walls": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["N", "E", "S", "W"] },
+            "default": ["N", "E", "S", "W"],
+            "description": "Which perimeter walls to build. Omit a side to leave it fully open (e.g. two rooms sharing a wall)."
+          }
+        }
+      }
+    },
+    "doorways": {
+      "type": "array",
+      "description": "Openings in a room wall. v0 builds the wall as segments that leave a gap (no CSG subtract) for robustness.",
+      "items": {
+        "type": "object",
+        "required": ["room", "side", "center", "width", "height"],
+        "additionalProperties": false,
+        "properties": {
+          "room": { "type": "string" },
+          "side": { "type": "string", "enum": ["N", "E", "S", "W"] },
+          "center": { "type": "number", "description": "Offset of opening center along the wall, from room center (uu)." },
+          "width": { "type": "number", "default": 192 },
+          "height": { "type": "number", "default": 288 },
+          "sill": { "type": "number", "default": 0, "description": "Height of opening bottom above the floor (uu). 0 = floor-level doorway; >0 = window." }
+        }
+      }
+    },
+    "pickups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["class", "location"],
+        "additionalProperties": false,
+        "properties": {
+          "class": {
+            "type": "string",
+            "description": "UT class or Blueprint. e.g. UTPickupHealth, UTArmor, or a weapon BP like BP_Sniper. Weapon pickups on maps are BP subclasses (BP_Sniper_C) — match via IsChildOf, not equality."
+          },
+          "location": { "$ref": "#/$defs/vec3" },
+          "yaw": { "type": "number", "default": 0 }
+        }
+      }
+    },
+    "playerStarts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["location"],
+        "additionalProperties": false,
+        "properties": {
+          "location": { "$ref": "#/$defs/vec3", "description": "Place ~32-48uu above the floor so the capsule doesn't spawn embedded." },
+          "yaw": { "type": "number", "default": 0 },
+          "team": { "type": "integer", "default": -1, "description": "-1 = any (FFA/Duel), 0 = red, 1 = blue." }
+        }
+      }
+    },
+    "lights": {
+      "type": "array",
+      "description": "Without lights + a lighting build the map renders unlit. At least one per room recommended for the PoC.",
+      "items": {
+        "type": "object",
+        "required": ["location"],
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string", "enum": ["Point", "Spot"], "default": "Point" },
+          "location": { "$ref": "#/$defs/vec3" },
+          "intensity": { "type": "number", "default": 5000 },
+          "radius": { "type": "number", "default": 1024 },
+          "color": { "$ref": "#/$defs/rgb", "default": [255, 255, 255] }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Provenance — which ElimPlus layout this was generated from, and any generation notes.",
+      "properties": {
+        "layout": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "vec3": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 },
+    "rgb": { "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3 }
+  }
+}

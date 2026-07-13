@@ -1,0 +1,11 @@
+# Generated T3D (regenerate with emit.py)
+Tools/mapgen/out/
+
+# Python
+__pycache__/
+*.pyc
+
+# UE4 editor-plugin build output (arrives with layer B, once Source/ exists)
+Binaries/
+Intermediate/
+Saved/

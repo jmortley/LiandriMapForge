@@ -1,0 +1,45 @@
+{
+  "name": "DM-RankinTrace",
+  "gametype": "DM",
+  "defaults": { "wallHeight": 512, "wallThickness": 32, "floorThickness": 32 },
+  "brushes": [
+    { "name": "floor_main",  "min": [-1625, -1350, -32], "max": [1875, 1900, 0] },
+    { "name": "floor_left",  "min": [-2375, -1500, -32], "max": [-1575, 1300, 0] },
+    { "name": "floor_bot",   "min": [-1625, -1975, -32], "max": [1325, -1350, 0] },
+    { "name": "floor_right", "min": [1875, -575, -32],   "max": [2400, 1050, 0] },
+
+    { "name": "peri_S", "min": [-2407, -2007, 0], "max": [2432, -1975, 512] },
+    { "name": "peri_N", "min": [-2407, 1900, 0],  "max": [2432, 1932, 512] },
+    { "name": "peri_W", "min": [-2407, -1975, 0], "max": [-2375, 1900, 512] },
+    { "name": "peri_E", "min": [2400, -1975, 0],  "max": [2432, 1900, 512] },
+
+    { "name": "struct_central",   "min": [-675, -450, 0], "max": [175, 350, 512] },
+    { "name": "struct_upperroom", "min": [-825, 1200, 0], "max": [175, 1650, 512] },
+    { "name": "struct_leftdiv",   "min": [-1925, -250, 0], "max": [-1650, 1050, 512] },
+    { "name": "struct_rightroom", "min": [1575, -350, 0], "max": [1925, 800, 512] },
+    { "name": "struct_rightdiag", "min": [975, -250, 0],  "max": [1325, 650, 512] },
+    { "name": "struct_midpillar", "min": [325, -350, 0],  "max": [450, 750, 512] }
+  ],
+  "playerStarts": [
+    { "location": [-1400, 1400, 96], "yaw": -45 },
+    { "location": [1400, -1000, 96], "yaw": 135 },
+    { "location": [-2000, -1000, 96], "yaw": 45 },
+    { "location": [1400, 1400, 96], "yaw": -135 }
+  ],
+  "pickups": [
+    { "type": "shieldbelt", "location": [-250, -800, 64] },
+    { "type": "health_medium", "location": [-1400, 0, 64] },
+    { "type": "health_medium", "location": [1400, 1000, 64] },
+    { "type": "armor_thighpads", "location": [1700, 400, 64] }
+  ],
+  "lights": [
+    { "type": "directional", "pitch": -52, "yaw": -35, "intensity": 8 },
+    { "type": "sky", "intensity": 2.0 },
+    { "location": [-1400, 800, 448], "intensity": 6000, "radius": 2600 },
+    { "location": [1400, -800, 448], "intensity": 6000, "radius": 2600 }
+  ],
+  "source": {
+    "layout": "ut4stats elimplus Rankin top-down (eyeballed)",
+    "notes": "Roofless single-level trace. Open top so the DirectionalLight + SkyLight fill it like real Rankin's skylight atrium. NOT real Rankin: no elevation/lifts, approximate scale."
+  }
+}

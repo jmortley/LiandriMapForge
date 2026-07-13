@@ -1,0 +1,25 @@
+{
+  "name": "DM-Box01",
+  "gametype": "DM",
+  "defaults": { "wallHeight": 512, "wallThickness": 32, "floorThickness": 32 },
+  "rooms": [
+    { "id": "arena", "min": [-1024, -1024, 0], "max": [1024, 1024, 512] },
+    { "id": "annex", "min": [1024, -512, 0], "max": [2048, 512, 512], "walls": ["N", "E", "S"] }
+  ],
+  "doorways": [
+    { "room": "arena", "side": "E", "center": 0, "width": 256, "height": 320 }
+  ],
+  "pickups": [
+    { "type": "health_medium", "location": [0, 0, 64] },
+    { "type": "shieldbelt", "location": [1536, 0, 64] }
+  ],
+  "playerStarts": [
+    { "location": [-768, -768, 96], "yaw": 45 },
+    { "location": [768, 768, 96], "yaw": 225 }
+  ],
+  "lights": [
+    { "location": [0, 0, 448], "intensity": 6000, "radius": 1600 },
+    { "location": [1536, 0, 448], "intensity": 5000, "radius": 1200 }
+  ],
+  "source": { "layout": "handmade PoC", "notes": "Two-room arena connected by a doorway; smoke test for the full pipeline." }
+}
