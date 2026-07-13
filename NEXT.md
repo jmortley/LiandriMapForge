@@ -47,5 +47,13 @@ inside UnrealEd and exposes an HTTP/socket endpoint, fronted by an MCP server (e
   - **Apply materials to BSP surfaces post-import** — retire the preloader hack.
 - Note: NetcodePlus already depends on `Http` + `Json`; the bridge is a small **Editor**-type module.
 
+**Structure recognition in a real map export** (tested on `capture/deck.t3d`): lifts are explicit
+(`Generic_Lift_C` + `UTLiftExit` — read base/travel/exit directly); ramps are detectable
+geometrically (BSP polys with a tilted normal, |Z| ~0.45–0.98); Deck's verticality is lifts, zero
+jump pads. **The upshot for Layer B: lifts I can lift-and-shift from the real map (extract →
+re-place as functional actors), ramps I can detect/author from slope, but "bridge" is a semantic
+label that needs a geometry-graph analysis to earn — worth building if we want the bridge to
+actually reason about a map's structure, not just its brushes.**
+
 Scope check with phantaci before building; he drives, verify against this fork's source, and
 keep the AI *outside* the editor (only translating intent → the editor's own command set).
