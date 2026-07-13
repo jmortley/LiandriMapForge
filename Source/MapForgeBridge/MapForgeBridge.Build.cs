@@ -17,7 +17,8 @@ namespace UnrealBuildTool.Rules
 				"UnrealEd",
 				"Networking",
 				"Sockets",
-				"Json"
+				"Json",
+				"AssetRegistry"   // forge_chassis_physasset: AssetCreated notify
 			});
 		}
 	}

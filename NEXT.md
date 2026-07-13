@@ -49,6 +49,12 @@ Pipeline: **layout PNG + real map bounds → MapSpec (JSON) → T3D → live edi
 - No HTTP server module in 4.15 (arrives 4.20); `FTicker` not `FTSTicker`;
   Build.cs uses `ModuleRules(TargetInfo)`; UnrealEd has `UnrealEdSharedPCH.h`
   so `UseExplicitOrSharedPCHs` just works; no UCLASSes in the module → no UHT.
+- **Codex MCP registration added (restart required):**
+  ```toml
+  [mcp_servers.mapforge]
+  command = "python"
+  args = ['C:\UnrealTournament\UnrealTournament\Plugins\LiandriMapForge\Tools\mapgen\mapforge_mcp.py']
+  ```
 - **Builds: phantaci runs them himself — do NOT invoke UBT/msbuild/UE4Editor.**
   Known-good command is in README (unset `VULKAN_SDK` — the machine's 1.4 SDK
   breaks 4.15 VulkanRHI; bundled headers compile clean; `-NoUBTMakefiles` if a
@@ -58,25 +64,75 @@ Pipeline: **layout PNG + real map bounds → MapSpec (JSON) → T3D → live edi
   [[ut4-cli-build-vulkan-gotcha]], [[dont-run-builds]].
 
 ## Next tasks (in rough order — scope-check with phantaci; he drives)
-1. **Triage the external audit** (a Codex audit of the bridge was planned —
-   check for its findings/report before touching the C++). Known soft spots
-   already on the list: no auth token on the socket (any local process can
-   drive the editor), selection clobbering, no FScopedTransaction (undo),
-   RecvBuf growth on garbage input, SendLine can stall the game thread ~10s on
-   a wedged client, behavior during PIE/modal dialogs untested.
+1. **Verify the audit-fix batch** (2026-07-13: Codex audited the bridge — all
+   16 findings accepted and patched in one pass: reversed TCP close detection
+   [this fork's Recv returns true/0 for would-block, FALSE for close —
+   SocketsBSD.cpp:187], queued non-blocking sends, framing caps, PIE/build
+   gating, FScopedTransaction undo, selection restore, current-level scoping
+   for list/delete/export, lighting poll via `IsLightingBuildCurrentlyRunning`
+   [NOT IsBuildCurrentlyRunning — that only tracks InProgressBuildId],
+   FGCObject preload pinning, save fail-fast, strict error propagation,
+   `loaders=False` actually working, bare `Texture=/Game/...` ref harvesting).
+   **Needs: phantaci builds, then `python Tools/mapgen/tests/bridge_smoke.py`
+   against a running editor.** Auth deliberately left out (localhost-only,
+   trusted box — his explicit call).
 2. **Emitter authoring for goo pools + lifts** — the bridge *imports* them
-   (proven); `emit.py`/MapSpec can't *author* them yet. Grammar to replicate is
-   in `capture/deck.t3d`: `UTPainVolume` = brush actor (polylist + BodySetup
-   AggGeom + DamagePerSec/sounds), lines ~33083; `Generic_Lift_C` = BP actor
-   (SCS components + `Lift Destination`/`Lift Time`), lines ~35512. Then
-   make_deckstyle's twin sludge channels become real recessed lethal pools and
-   its jump pads can become lifts.
+   (proven); `emit.py`/MapSpec can't *author* them yet. Grammar fixtures are
+   TRACKED at `Tools/mapgen/capture/fixtures/utpainvolume.t3d` (brush actor:
+   polylist + BodySetup AggGeom + DamagePerSec/sounds) and
+   `fixtures/generic_lift.t3d` (BP actor: SCS components + `Lift Destination`/
+   `Lift Time`). Then make_deckstyle's twin sludge channels become real
+   recessed lethal pools and its jump pads can become lifts. Prefer a minimal
+   stable property subset over cloning whole construction-script blocks.
 3. **Retire the paste workflow in docs/examples** once (2) lands; keep it as
    fallback.
 4. **Layout → MapSpec vision step** (elimplus PNG → structured spec).
 5. Deferred by explicit scope decision: structure recognition (geometry-graph
    semantic labels, lift lift-and-shift, ramp-from-slope).
 
-Working state note: Layer B changes are **uncommitted** in the plugin repo
-(new .uplugin, Source/, mapforge_mcp.py + emit.py + README/NEXT edits) —
-phantaci reviews/commits.
+Also uncommitted: **`forge_chassis_physasset`** bridge verb (asset authoring, not
+level) — duplicates a skeletal mesh's default UPhysicsAsset, keeps one bone's
+body, drops the rest + constraints, saves. Optional convenience for UTVehicles'
+UT3 imports (runtime already neutralizes extra bodies). Adds `AssetRegistry`
+to the module deps. APIs verified in-tree: PhysicsAsset.h:66/73/153/156,
+SkeletalMesh.h:688/732, StaticDuplicateObject (UObjectGlobals.h:281). Smoke:
+run on SK_VH_Scorpion_001 with defaults → 1 body / 0 constraints, rerun to
+confirm clean overwrite; all 10 vehicles under
+/Game/RestrictedAssets/Proto/UT3_Vehicles/ are valid inputs.
+See memory [[utvehicles-project]].
+
+Also uncommitted: **Blueprint authoring Tiers 1 + 2** — bridge verbs
+`create_blueprint`, `set_class_defaults` (Tier 1: subclass AUTMutator/AUTGameMode
++ CDO property overrides, the config-variant path) and `add_variable`,
+`import_graph`, `compile_blueprint`, `export_graph` (Tier 2: graph logic via the
+clipboard-text round-trip). MCP tools: `bridge_create_blueprint`,
+`bridge_set_class_defaults`, `forge_bp_variant`, `bridge_add_variable`,
+`bridge_import_graph`, `bridge_compile_blueprint`, `bridge_export_graph`,
+`forge_bp_graph` (one-shot create→add-vars→rehome→import→compile), plus the
+`rehome_graph_text` helper (repoints owning-class refs into the new BP).
+
+All APIs in UnrealEd (already a dep; **zero new module deps**) — verified in-tree:
+CreateBlueprint/CompileBlueprint (KismetEditorUtilities.h:66/108), AddMemberVariable
+(BlueprintEditorUtils.h:709), ImportNodesFromText/ExportNodesToText/CanImportNodesFromText
+(EdGraphUtilities.h:107/98/115), FEdGraphPinType (EdGraphPin.h:126, Engine),
+node error fields bHasCompilerMessage/ErrorType/ErrorMsg (EdGraphNode.h:141/167/171).
+K2Node_* are resolved by the loaded BlueprintGraph module's text factory at import
+time, so we never link them (sidesteps their missing dllexports). All asset-writing
+verbs are in IsMutatingCmd (SavePackage → PIE-gated). `compile_blueprint` reports
+node-level errors so import-success≠validity is caught.
+
+Smoke (after build + editor restart):
+- Tier 1: `forge_bp_variant("UTMutator", "/Game/Mods/Mutators/Mutator_Test", {...})`
+  → reopen, confirm Class Defaults panel shows the override.
+- Tier 2 round-trip (no hand-authoring): `bridge_export_graph` a shipped BP mutator
+  (e.g. `Mutator_LowGrav`) → `forge_bp_graph(parent="UTMutator", package=..., graph_t3d=<that>)`
+  → expect compiled.status up_to_date (add its self-context vars via `variables=[...]`
+  if any). See `capture/fixtures/README.md` for capture guidance.
+
+Deferred (unchanged): structure recognition (geometry-graph semantic labels,
+lift lift-and-shift, ramp-from-slope).
+
+Working state note: bridge v1 is committed/pushed (`b29ce7b`); the audit-fix
+batch (server rewrite + Python fixes + fixtures + tests/bridge_smoke.py) plus
+the `forge_chassis_physasset` verb are **uncommitted pending phantaci's build +
+smoke test**.

@@ -1,0 +1,80 @@
+      Begin Actor Class=Generic_Lift_C Name=Generic_Lift_2 Archetype=Generic_Lift_C'/Game/RestrictedAssets/Blueprints/Lift/Generic_Lift.Default__Generic_Lift_C'
+         Begin Object Class=MaterialInstanceDynamic Name="MaterialInstanceDynamic_85"
+         End Object
+         Begin Object Class=TimelineComponent Name="Lift Move"
+         End Object
+         Begin Object Class=StaticMeshComponent Name="Top Preview" Archetype=StaticMeshComponent'Generic_Lift_C:StaticMeshComponent_119'
+         End Object
+         Begin Object Class=AudioComponent Name="A_MoveLoop" Archetype=AudioComponent'Generic_Lift_C:A_MoveLoop_GEN_VARIABLE'
+         End Object
+         Begin Object Class=StaticMeshComponent Name="Mesh" Archetype=StaticMeshComponent'Generic_Lift_C:StaticMeshComponent_117'
+         End Object
+         Begin Object Class=SceneComponent Name="Scene1" Archetype=SceneComponent'Generic_Lift_C:SceneComponent_55'
+         End Object
+         Begin Object Class=MaterialInstanceDynamic Name="MaterialInstanceDynamic_84"
+         End Object
+         Begin Object Name="MaterialInstanceDynamic_85"
+            Parent=Material'/Game/RestrictedAssets/Blueprints/Lift/M_LiftPreview.M_LiftPreview'
+            VectorParameterValues(0)=(ParameterName="Color&Opacity",ParameterValue=(R=1.000000,G=1.000000,B=1.000000,A=1.000000))
+            LightingGuid=5377511F4B4F044AF1C46F822E23A438
+         End Object
+         Begin Object Name="Lift Move"
+            TheTimeline=(LengthMode=TL_TimelineLength,Length=1.000000,PlayRate=0.800000,InterpFloats=((FloatCurve=CurveFloat'/Game/RestrictedAssets/Blueprints/Lift/Generic_Lift.Generic_Lift_C:CurveFloat_0__256DA8D9',TrackName="0-1 Lerp",FloatPropertyName="Lift_Move_0_1_Lerp_2894DEA749EC00A076BE7E931F3D3C0E")),TimelinePostUpdateFunc=Generic_Lift_2.Lift Move__UpdateFunc,TimelineFinishedFunc=Generic_Lift_2.Lift Move__FinishedFunc,PropertySetObject=Generic_Lift_C'Generic_Lift_2',DirectionPropertyName="Lift_Move__Direction_2894DEA749EC00A076BE7E931F3D3C0E")
+            bReplicates=True
+            bNetAddressable=True
+            CreationMethod=UserConstructionScript
+         End Object
+         Begin Object Name="Top Preview"
+            StaticMesh=StaticMesh'/Game/RestrictedAssets/Meshes/TemplateCube_Rounded.TemplateCube_Rounded'
+            OverrideMaterials(0)=MaterialInstanceDynamic'MaterialInstanceDynamic_85'
+            AttachParent=Scene1
+            RelativeLocation=(X=0.000000,Y=0.000000,Z=4860.000000)
+            bNetAddressable=True
+            CreationMethod=SimpleConstructionScript
+            UCSModifiedProperties(0)=(MemberParent=Class'/Script/Engine.StaticMeshComponent',MemberName="StaticMesh")
+            UCSModifiedProperties(1)=(MemberParent=Class'/Script/Engine.MeshComponent',MemberName="OverrideMaterials")
+            UCSModifiedProperties(2)=(MemberParent=Class'/Script/Engine.SceneComponent',MemberName="RelativeLocation")
+         End Object
+         Begin Object Name="A_MoveLoop"
+            AttachParent=Mesh
+            bNetAddressable=True
+            CreationMethod=SimpleConstructionScript
+         End Object
+         Begin Object Name="Mesh"
+            StaticMesh=StaticMesh'/Game/RestrictedAssets/Meshes/TemplateCube_Rounded.TemplateCube_Rounded'
+            OverrideMaterials(0)=MaterialInstanceConstant'/Game/RestrictedAssets/Environments/Liandri/Materials/M_LI_CenterPiece2_Inst_Inst_Inst.M_LI_CenterPiece2_Inst_Inst_Inst'
+            OnComponentBeginOverlap=(Generic_Lift_2.OnOverlapBegin)
+            AttachParent=Scene1
+            bNetAddressable=True
+            CreationMethod=SimpleConstructionScript
+            UCSModifiedProperties(0)=(MemberParent=Class'/Script/Engine.StaticMeshComponent',MemberName="StaticMesh")
+            UCSModifiedProperties(1)=(MemberParent=Class'/Script/Engine.MeshComponent',MemberName="OverrideMaterials")
+         End Object
+         Begin Object Name="Scene1"
+            RelativeLocation=(X=3090.000000,Y=7000.000000,Z=-493.056763)
+            RelativeScale3D=(X=2.500000,Y=2.000000,Z=0.250000)
+            bNetAddressable=True
+            CreationMethod=SimpleConstructionScript
+            UCSModifiedProperties(0)=(MemberParent=Class'/Script/Engine.SceneComponent',MemberName="RelativeLocation")
+            UCSModifiedProperties(1)=(MemberParent=Class'/Script/Engine.SceneComponent',MemberName="RelativeScale3D")
+         End Object
+         Begin Object Name="MaterialInstanceDynamic_84"
+            Parent=Material'/Game/RestrictedAssets/Blueprints/Lift/M_LiftPreview.M_LiftPreview'
+            VectorParameterValues(0)=(ParameterName="Color&Opacity",ParameterValue=(R=1.000000,G=1.000000,B=1.000000,A=1.000000),ExpressionGUID=FAB77D5E41686C31F9E1C681EA7573E8)
+            LightingGuid=D295C62F412BDAE62BE7B0BD4F719BF7
+         End Object
+         Top Preview="Top Preview"
+         A_MoveLoop=A_MoveLoop
+         Mesh=Mesh
+         Scene1=Scene1
+         Lift Move=TimelineComponent'"Lift Move"'
+         Lift Mesh=StaticMesh'/Game/RestrictedAssets/Meshes/TemplateCube_Rounded.TemplateCube_Rounded'
+         OverrideMaterial=MaterialInstanceConstant'/Game/RestrictedAssets/Environments/Liandri/Materials/M_LI_CenterPiece2_Inst_Inst_Inst.M_LI_CenterPiece2_Inst_Inst_Inst'
+         Lift Destination=(X=0.000000,Y=0.000000,Z=4860.000000)
+         Lift Time=1.250000
+         Wait at top time=1.500000
+         EncroachComponent=Mesh
+         RootComponent=Scene1
+         ActorLabel="Generic_Lift_2"
+         FolderPath="Pickups"
+      End Actor

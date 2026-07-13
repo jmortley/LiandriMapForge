@@ -4,6 +4,8 @@ Tools/mapgen/out/
 # Large real-map T3D exports — reference only, re-exportable from the editor
 Tools/mapgen/capture/*.t3d
 !Tools/mapgen/capture/ground-truth.t3d
+# Small tracked grammar fixtures excerpted from the deck capture
+!Tools/mapgen/capture/fixtures/
 
 # Python
 __pycache__/

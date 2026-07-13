@@ -36,8 +36,12 @@ class BridgeError(RuntimeError):
     """The editor bridge is unreachable, or refused/failed a command."""
 
 
+_MAX_RESPONSE_BYTES = 256 * 1024 * 1024
+
+
 def _bridge_call(cmd, args=None, timeout=600.0):
-    """One request/response round-trip with the in-editor bridge."""
+    """One request/response round-trip with the in-editor bridge. Raises
+    BridgeError with the failing phase for every transport problem."""
     request = json.dumps({"id": 1, "cmd": cmd, "args": args or {}})
     try:
         sock = socket.create_connection((BRIDGE_HOST, BRIDGE_PORT), timeout=10.0)
@@ -47,38 +51,61 @@ def _bridge_call(cmd, args=None, timeout=600.0):
             "the LiandriMapForge plugin enabled? (%s)" % (BRIDGE_HOST, BRIDGE_PORT, e))
     try:
         sock.settimeout(timeout)
-        sock.sendall(request.encode("utf-8") + b"\n")
+        try:
+            sock.sendall(request.encode("utf-8") + b"\n")
+        except OSError as e:
+            raise BridgeError("send failed for '%s': %s" % (cmd, e))
         buf = bytearray()
         while not buf.endswith(b"\n"):
-            chunk = sock.recv(1 << 16)
+            try:
+                chunk = sock.recv(1 << 16)
+            except socket.timeout:
+                raise BridgeError(
+                    "'%s' timed out after %.0fs (editor busy in a modal task?)" % (cmd, timeout))
+            except OSError as e:
+                raise BridgeError("receive failed for '%s': %s" % (cmd, e))
             if not chunk:
-                raise BridgeError("bridge closed the connection mid-response")
+                raise BridgeError("bridge closed the connection mid-response to '%s'" % cmd)
             buf += chunk
+            if len(buf) > _MAX_RESPONSE_BYTES:
+                raise BridgeError("'%s' response exceeded %d bytes" % (cmd, _MAX_RESPONSE_BYTES))
     finally:
         sock.close()
-    response = json.loads(buf.decode("utf-8"))
+    try:
+        response = json.loads(buf.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise BridgeError("malformed response to '%s': %s" % (cmd, e))
     if not response.get("ok"):
         raise BridgeError(response.get("error", "unknown bridge error"))
     return response.get("result")
 
 
 _ASSET_REF = re.compile(r"'(/(?:Game|Engine)/[^']+)'")
+# BSP polygons reference materials UNQUOTED (Texture=/Game/... -- emit.py and
+# real map exports alike); TextureStreamingData carries bare paths too.
+_ASSET_REF_BARE = re.compile(r"=(/(?:Game|Engine)/[^\s'\",)]+)")
 
 
 def _asset_refs(t3d):
-    """Every /Game/ and /Engine/ object path a T3D document references.
-    Subobject refs (Pkg.Obj:Sub) are trimmed to Pkg.Obj -- loading the outer
-    object is what pins the package."""
-    return sorted({m.split(":", 1)[0] for m in _ASSET_REF.findall(t3d)})
+    """Every /Game/ and /Engine/ object path a T3D document references,
+    quoted (Class'/Game/...') or bare (Texture=/Game/...). Subobject refs
+    (Pkg.Obj:Sub) are trimmed to Pkg.Obj -- loading the outer object is what
+    pins the package."""
+    refs = set(_ASSET_REF.findall(t3d)) | set(_ASSET_REF_BARE.findall(t3d))
+    return sorted({m.split(":", 1)[0] for m in refs})
 
 
-def _import_t3d(t3d, preload=True):
+def _import_t3d(t3d, preload=True, require_all_assets=True):
+    preloaded = {"loaded": 0, "failed": []}
     if preload:
         refs = _asset_refs(t3d)
         if refs:
             preloaded = _bridge_call("preload_assets", {"paths": refs})
-        else:
-            preloaded = {"loaded": 0, "failed": []}
+        # Fail fast: importing with unresolved refs silently drops properties
+        # or whole actors, then reports success.
+        if preloaded.get("failed") and require_all_assets:
+            raise BridgeError("assets failed to load, aborting import: %s"
+                              % ", ".join(preloaded["failed"]))
     result = _bridge_call("import_t3d", {"t3d": t3d})
     if preload:
         result["preload"] = preloaded
@@ -119,17 +146,22 @@ def smoke_cube() -> str:
 @mcp.tool()
 def bridge_status() -> dict:
     """Ping the live UnrealEd bridge: engine version, current map, dirty flag,
-    actor count, and whether a lighting/nav build is currently running."""
+    level lock, actor count, PIE state, and build flags. Poll
+    'lighting_building' for Lightmass completion ('editor_building' tracks
+    other FEditorBuildUtils builds; 'building' is the union)."""
     return _bridge_call("ping")
 
 
 @mcp.tool()
-def bridge_import_t3d(t3d: str, preload: bool = True) -> dict:
+def bridge_import_t3d(t3d: str, preload: bool = True,
+                      require_all_assets: bool = True) -> dict:
     """Import a T3D document into the level open in UnrealEd. First preloads
-    every /Game/ and /Engine/ asset the T3D references, so materials, Blueprint
-    actors (lifts, pickups), sounds and damage types all resolve on a fresh
-    level -- no preloader-cube hack. Follow with bridge_rebuild_geometry()."""
-    return _import_t3d(t3d, preload=preload)
+    every /Game/ and /Engine/ asset the T3D references (quoted or bare), so
+    materials, Blueprint actors (lifts, pickups), sounds and damage types all
+    resolve on a fresh level -- no preloader-cube hack. Errors if any required
+    asset fails to load (set require_all_assets=False to import anyway) or if
+    the import creates no actors. Follow with bridge_rebuild_geometry()."""
+    return _import_t3d(t3d, preload=preload, require_all_assets=require_all_assets)
 
 
 @mcp.tool()
@@ -163,11 +195,13 @@ def bridge_build(what: str = "lighting") -> dict:
 
 
 @mcp.tool()
-def bridge_save(filename: str = "") -> dict:
+def bridge_save(filename: str = "", allow_dialog: bool = False) -> dict:
     """Save the current level. A never-saved level needs an explicit
-    'filename' (else UnrealEd pops a modal Save-As dialog and the call
-    blocks until a human answers it)."""
-    args = {"filename": filename} if filename else {}
+    'filename'; without one the bridge fails fast instead of blocking on a
+    modal Save-As dialog (pass allow_dialog=True to permit the dialog)."""
+    args = {"allow_dialog": allow_dialog}
+    if filename:
+        args["filename"] = filename
     return _bridge_call("save_level", args)
 
 
@@ -198,21 +232,25 @@ def bridge_export_t3d(selected_only: bool = False, save_to: str = "") -> dict:
 
 @mcp.tool()
 def bridge_list_actors(name_contains: str = "", class_contains: str = "",
-                       limit: int = 200) -> dict:
-    """List actors in the open level (name, label, class, location), filtered
-    by case-insensitive substrings of name/label and/or class."""
+                       limit: int = 200, all_levels: bool = False) -> dict:
+    """List actors in the current level (name, label, class, location),
+    filtered by case-insensitive substrings of name/label and/or class.
+    all_levels=True widens to every loaded streaming level (entries then
+    include their level)."""
     return _bridge_call("list_actors", {
         "name_contains": name_contains,
         "class_contains": class_contains,
         "limit": limit,
+        "all_levels": all_levels,
     })
 
 
 @mcp.tool()
 def bridge_delete_actors(names: list) -> dict:
-    """Delete actors by name or label (case-insensitive exact match). Builder
-    brush and WorldSettings are always protected. Use with bridge_list_actors
-    to clear and re-import a region instead of starting a fresh level."""
+    """Delete actors in the CURRENT level by name or label (case-insensitive
+    exact match; actor names are only unique per level). Builder brush and
+    WorldSettings are always protected, locked levels are rejected, and the
+    deletion is a single undoable transaction."""
     return _bridge_call("delete_actors", {"names": names})
 
 
@@ -227,6 +265,157 @@ def bridge_set_surface_material(material: str, brush: str = "",
     if normal:
         args["normal"] = normal
     return _bridge_call("set_surface_material", args)
+
+
+@mcp.tool()
+def forge_chassis_physasset(mesh: str, bone: str = "", target: str = "") -> dict:
+    """Forge a clean chassis-only UPhysicsAsset next to a skeletal mesh, so a
+    vehicle can opt into it via PhysicsAssetOverride. Duplicates the mesh's
+    default physics asset (never modifies the source or the mesh), keeps only
+    the chosen bone's body, drops every other body + all constraints, and
+    saves the result.
+
+    mesh:   skeletal mesh package path, e.g.
+            /Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Scorpion/Meshes/SK_VH_Scorpion_001
+            (bare package path or full Package.Asset object path both work).
+    bone:   bone whose body to keep; default = the mesh's root bone (index 0).
+            Errors listing the available body bones if this bone has no body.
+    target: package path for the new asset; default = "<mesh>_Physics".
+            Re-running overwrites the target cleanly.
+
+    Returns {asset, kept_bone, removed_bodies, removed_constraints, saved}."""
+    args = {"mesh": mesh}
+    if bone:
+        args["bone"] = bone
+    if target:
+        args["target"] = target
+    return _bridge_call("forge_chassis_physasset", args)
+
+
+@mcp.tool()
+def bridge_create_blueprint(parent: str, package: str, name: str = "",
+                            overwrite: bool = False) -> dict:
+    """Create a Blueprint subclass in the open editor, compile, and save.
+    'parent' is a bare native class name ("UTMutator"), a full class path
+    ("/Script/UnrealTournament.UTMutator"), or a Blueprint package path (whose
+    generated class becomes the parent). 'package' is the target asset path
+    (e.g. "/Game/Mods/Mutators/Mutator_Foo"); 'name' overrides the leaf.
+    AUTMutator is Blueprintable; AUTGameMode is Blueprintable by inheritance.
+    Returns {asset, generated_class, parent, saved}."""
+    args = {"parent": parent, "package": package, "overwrite": overwrite}
+    if name:
+        args["name"] = name
+    return _bridge_call("create_blueprint", args)
+
+
+@mcp.tool()
+def bridge_set_class_defaults(asset: str, defaults: dict) -> dict:
+    """Override default (CDO) property values on a Blueprint class and save --
+    the Tier-1 'config variant' path (no graph logic). 'defaults' maps property
+    name -> value; bools/numbers are converted, and strings pass through as UE
+    property literals (e.g. "(X=1,Y=2,Z=3)" for a struct, an enum name, or a
+    class path). Inherited native properties of the parent mutator/gamemode
+    (bForceRespawn, TimeLimit, GoalScore, ...) are valid targets. Returns
+    {applied, failed, saved}."""
+    return _bridge_call("set_class_defaults", {"asset": asset, "defaults": defaults})
+
+
+@mcp.tool()
+def forge_bp_variant(parent: str, package: str, defaults: dict = None,
+                     name: str = "", overwrite: bool = False) -> dict:
+    """One-shot Tier-1 authoring: create a Blueprint subclass then set its CDO
+    defaults in a single call -- the config-variant mutator/gamemode workflow.
+    Returns the create result plus a 'defaults' field with the apply outcome."""
+    created = bridge_create_blueprint(parent, package, name=name, overwrite=overwrite)
+    if defaults:
+        created["defaults"] = bridge_set_class_defaults(created["asset"], defaults)
+    return created
+
+
+# ---- Tier 2: Blueprint graph authoring (clipboard-text round-trip) -----------
+
+_BPGC_REF = re.compile(r"BlueprintGeneratedClass'([^']+)'")
+
+
+def rehome_graph_text(text, new_bpgc, old_bpgc=None):
+    """Repoint self/owning-class references in exported graph text to a new
+    BlueprintGeneratedClass path, so a graph captured from one Blueprint imports
+    cleanly into another. With old_bpgc, only that path is rewritten; otherwise
+    every BlueprintGeneratedClass ref is repointed to new_bpgc (the single-source
+    fixture case). Self-context variable/event refs carry no class path -- they
+    resolve against the target BP's own members, which is why those variables
+    must be added (bridge_add_variable) before import."""
+    if old_bpgc:
+        return text.replace("BlueprintGeneratedClass'%s'" % old_bpgc,
+                            "BlueprintGeneratedClass'%s'" % new_bpgc)
+    return _BPGC_REF.sub("BlueprintGeneratedClass'%s'" % new_bpgc, text)
+
+
+@mcp.tool()
+def bridge_add_variable(asset: str, name: str, type: str, default: str = "") -> dict:
+    """Add a member variable to a Blueprint (needed before importing a graph
+    that references it by self-context). 'type' is a scalar ("bool", "int",
+    "float", "string", "name", "byte") or "object:<class>" / "class:<class>" /
+    "struct:<path>", with an optional "[]" array suffix. Returns
+    {variable, type, saved}."""
+    return _bridge_call("add_variable", {
+        "asset": asset, "name": name, "type": type, "default": default,
+    })
+
+
+@mcp.tool()
+def bridge_import_graph(asset: str, t3d: str, graph: str = "") -> dict:
+    """Import Blueprint graph nodes (clipboard-text T3D, e.g. from
+    bridge_export_graph) into a Blueprint. 'graph' defaults to the event graph;
+    name a function graph to target it. Runs the editor's post-paste fix-up.
+    Follow with bridge_compile_blueprint to surface node errors. Returns
+    {graph, count, nodes, saved}."""
+    return _bridge_call("import_graph", {"asset": asset, "t3d": t3d, "graph": graph})
+
+
+@mcp.tool()
+def bridge_compile_blueprint(asset: str) -> dict:
+    """Compile a Blueprint and save. Returns {status, ok, messages, saved};
+    'messages' lists node-level compiler errors/warnings (node, error_type,
+    message) -- import success is not validity, so always compile and read
+    these before trusting a graph."""
+    return _bridge_call("compile_blueprint", {"asset": asset})
+
+
+@mcp.tool()
+def bridge_export_graph(asset: str, graph: str = "", save_to: str = "") -> dict:
+    """Export a Blueprint graph as clipboard-text T3D -- the read-back half of
+    the loop and the way to capture graph fixtures from a real Blueprint.
+    'graph' defaults to the event graph. Pass 'save_to' (absolute path) to write
+    the text to disk and return path + length instead of the full body."""
+    result = _bridge_call("export_graph", {"asset": asset, "graph": graph})
+    if save_to:
+        with open(save_to, "w", encoding="utf-8", newline="") as f:
+            f.write(result.pop("t3d"))
+        result["saved_to"] = save_to
+    return result
+
+
+@mcp.tool()
+def forge_bp_graph(parent: str, package: str, graph_t3d: str, variables: list = None,
+                   rehome: bool = True, name: str = "", overwrite: bool = False) -> dict:
+    """Full Tier-2 one-shot: create a Blueprint subclass, add member variables,
+    import an event graph (clipboard-text), and compile -- returning each step's
+    result. 'variables' is a list of {name, type, default?} added before import
+    (so self-context references resolve). 'graph_t3d' is exported graph text;
+    with rehome=True its owning-class references are repointed to the new class.
+    Seed 'graph_t3d' from bridge_export_graph on a real Blueprint rather than
+    hand-authoring node text."""
+    created = bridge_create_blueprint(parent, package, name=name, overwrite=overwrite)
+    asset = created["asset"]
+    gen = created.get("generated_class") or ""
+    added = []
+    for v in (variables or []):
+        added.append(bridge_add_variable(asset, v["name"], v["type"], v.get("default", "")))
+    text = rehome_graph_text(graph_t3d, gen) if (rehome and gen) else graph_t3d
+    imported = bridge_import_graph(asset, text)
+    compiled = bridge_compile_blueprint(asset)
+    return {"created": created, "variables": added, "imported": imported, "compiled": compiled}
 
 
 if __name__ == "__main__":

@@ -1,0 +1,98 @@
+      Begin Actor Class=UTPainVolume Name=UTPainVolume_1 Archetype=UTPainVolume'/Script/UnrealTournament.Default__UTPainVolume'
+         Begin Brush Name=Model_6
+         End Brush
+         Begin Object Class=CubeBuilder Name="CubeBuilder_4"
+         End Object
+         Begin Object Class=BrushComponent Name="BrushComponent0" Archetype=BrushComponent'Default__UTPainVolume:BrushComponent0'
+            Begin Object Class=BodySetup Name="BodySetup_120"
+            End Object
+         End Object
+         Begin Object Name="CubeBuilder_4"
+         End Object
+         Begin Object Name="BrushComponent0"
+            Begin Object Name="BodySetup_120"
+               AggGeom=(ConvexElems=((VertexData=((X=-1550.000000,Y=5935.000000,Z=-100.000000),(X=-1550.000000,Y=5935.000000,Z=575.000000),(X=-1550.000000,Y=-200.000000,Z=575.000000),(X=-1550.000000,Y=-200.000000,Z=-100.000000),(X=1700.000000,Y=5935.000000,Z=-100.000000),(X=1700.000000,Y=5935.000000,Z=575.000000),(X=1700.000000,Y=-200.000000,Z=-100.000000),(X=1700.000000,Y=-200.000000,Z=575.000000)),ElemBox=(Min=(X=-1550.000000,Y=-200.000000,Z=-100.000000),Max=(X=1700.000000,Y=5935.000000,Z=575.000000),IsValid=1))))
+               bGenerateMirroredCollision=False
+               CollisionTraceFlag=CTF_UseSimpleAsComplex
+            End Object
+            Brush=Model'Model_6'
+            BrushBodySetup=BodySetup'BodySetup_120'
+            RelativeLocation=(X=3800.000000,Y=-310.000000,Z=-1100.000000)
+         End Object
+         EntrySound=SoundCue'/Game/RestrictedAssets/Audio/Character/Male01/A_Male01_SlimeEnter01_Cue.A_Male01_SlimeEnter01_Cue'
+         ExitSound=SoundCue'/Game/RestrictedAssets/Audio/Character/Male01/A_Male01_SlimeExit01_Cue.A_Male01_SlimeExit01_Cue'
+         DamagePerSec=20.000000
+         DamageType=BlueprintGeneratedClass'/Engine/EngineDamageTypes/DmgTypeBP_Environmental.DmgTypeBP_Environmental_C'
+         BrushType=Brush_Add
+         Begin Brush Name=Model_6
+            Begin PolyList
+               Begin Polygon Link=0
+                  Origin   -00100.000000,-00100.000000,-00100.000000
+                  Normal   -00001.000000,+00000.000000,+00000.000000
+                  TextureU +00000.000000,+00001.000000,+00000.000000
+                  TextureV +00000.000000,+00000.000000,-00001.000000
+                  Vertex   -01550.000000,-00200.000000,-00100.000000
+                  Vertex   -01550.000000,-00200.000000,+00575.000000
+                  Vertex   -01550.000000,+05935.000000,+00575.000000
+                  Vertex   -01550.000000,+05935.000000,-00100.000000
+               End Polygon
+               Begin Polygon Link=1
+                  Origin   -00100.000000,+00100.000000,-00100.000000
+                  Normal   +00000.000000,+00001.000000,+00000.000000
+                  TextureU +00001.000000,-00000.000000,+00000.000000
+                  TextureV +00000.000000,+00000.000000,-00001.000000
+                  Vertex   -01550.000000,+05935.000000,-00100.000000
+                  Vertex   -01550.000000,+05935.000000,+00575.000000
+                  Vertex   +01700.000000,+05935.000000,+00575.000000
+                  Vertex   +01700.000000,+05935.000000,-00100.000000
+               End Polygon
+               Begin Polygon Link=2
+                  Origin   +00100.000000,+00100.000000,-00100.000000
+                  Normal   +00001.000000,+00000.000000,+00000.000000
+                  TextureU +00000.000000,-00001.000000,+00000.000000
+                  TextureV +00000.000000,+00000.000000,-00001.000000
+                  Vertex   +01700.000000,+05935.000000,-00100.000000
+                  Vertex   +01700.000000,+05935.000000,+00575.000000
+                  Vertex   +01700.000000,-00200.000000,+00575.000000
+                  Vertex   +01700.000000,-00200.000000,-00100.000000
+               End Polygon
+               Begin Polygon Link=3
+                  Origin   +00100.000000,-00100.000000,-00100.000000
+                  Normal   +00000.000000,-00001.000000,+00000.000000
+                  TextureU -00001.000000,-00000.000000,-00000.000000
+                  TextureV +00000.000000,+00000.000000,-00001.000000
+                  Vertex   +01700.000000,-00200.000000,-00100.000000
+                  Vertex   +01700.000000,-00200.000000,+00575.000000
+                  Vertex   -01550.000000,-00200.000000,+00575.000000
+                  Vertex   -01550.000000,-00200.000000,-00100.000000
+               End Polygon
+               Begin Polygon Link=4
+                  Origin   -00100.000000,+00100.000000,+00100.000000
+                  Normal   +00000.000000,+00000.000000,+00001.000000
+                  TextureU +00001.000000,+00000.000000,+00000.000000
+                  TextureV +00000.000000,+00001.000000,+00000.000000
+                  Vertex   -01550.000000,+05935.000000,+00575.000000
+                  Vertex   -01550.000000,-00200.000000,+00575.000000
+                  Vertex   +01700.000000,-00200.000000,+00575.000000
+                  Vertex   +01700.000000,+05935.000000,+00575.000000
+               End Polygon
+               Begin Polygon Link=5
+                  Origin   -00100.000000,-00100.000000,-00100.000000
+                  Normal   +00000.000000,+00000.000000,-00001.000000
+                  TextureU +00001.000000,+00000.000000,+00000.000000
+                  TextureV +00000.000000,-00001.000000,+00000.000000
+                  Vertex   -01550.000000,-00200.000000,-00100.000000
+                  Vertex   -01550.000000,+05935.000000,-00100.000000
+                  Vertex   +01700.000000,+05935.000000,-00100.000000
+                  Vertex   +01700.000000,-00200.000000,-00100.000000
+               End Polygon
+            End PolyList
+         End Brush
+         Brush=Model'Model_6'
+         BrushComponent=BrushComponent0
+         BrushBuilder=CubeBuilder'CubeBuilder_4'
+         bHidden=False
+         RootComponent=BrushComponent0
+         Layers(0)="Cube"
+         ActorLabel="UTPainVolume1"
+      End Actor

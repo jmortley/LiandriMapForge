@@ -52,6 +52,11 @@ elimplus layout PNG ──(vision)──▶ MapSpec (JSON) ──(emit.py)──
 - [x] Emitter: doorway gaps + actors (PlayerStart / PointLight / BP pickups)
 - [x] MCP connector, layer A (stateless) — `Tools/mapgen/mapforge_mcp.py` wraps the emitter as MCP tools
 - [x] **MCP connector, layer B — the live editor bridge.** C++ editor-only module (`MapForgeBridge`) inside UnrealEd: localhost JSON-lines TCP → T3D import, asset preload, CSG rebuild, lighting/nav build, save, T3D export, BSP surface materials, actor query/delete, raw exec. Fronted by `bridge_*` / `forge_mapspec` MCP tools. The UE4.15 analog of Epic's UE5.8 editor MCP.
+- [x] Bridge hardening pass (external audit) — reversed-close fix, queued non-blocking sends, framing caps, PIE/build gating, undo transactions, current-level scoping, GC-pinned preloads, strict error propagation
+- [x] **Asset authoring, not just levels** — the bridge grew past map building:
+  - `forge_chassis_physasset` — duplicate-and-strip a skeletal mesh's `UPhysicsAsset` to a clean chassis-only asset (UTVehicles `PhysicsAssetOverride`)
+  - **Blueprint authoring Tier 1** — `create_blueprint` a subclass of `AUTMutator`/`AUTGameMode` + `set_class_defaults` (CDO overrides): the config-variant path, no graph
+  - **Blueprint authoring Tier 2** — `add_variable` + `import_graph` (clipboard-text) + `compile_blueprint` + `export_graph`: real graph logic, seeded by re-homing a graph captured from a shipped BP
 - [ ] Emitter authoring for goo POOLS (`UTPainVolume`) + functional lifts (`Generic_Lift_C`) — the bridge imports both correctly (verified against `capture/deck.t3d` blocks); MapSpec/emit.py just can't author them yet
 - [ ] Verticality + weapons — jump pads, lifts, `WeaponBase_C` + ammo (serialization captured from a real map)
 - [ ] **Layout → MapSpec vision step** (elimplus PNG → structured spec)
@@ -65,24 +70,51 @@ with `[MapForgeBridge] Port=` in the per-project editor ini, `-MapForgePort=`
 on the editor command line, or `MAPFORGE_BRIDGE_PORT` for the Python side).
 Protocol: JSON-lines over TCP — `{"id","cmd","args"}` in, `{"id","ok","result"|"error"}` out.
 Everything executes on the game thread via the core ticker (the engine's own
-SlateRemote pattern), because editor APIs are game-thread-only.
+SlateRemote pattern), because editor APIs are game-thread-only. Mutating verbs
+are rejected while PIE/simulate or a lighting/editor build is active, run
+inside undo transactions, and fail loudly (`ok=false`) instead of reporting
+partial work as success. **Security posture (deliberate):** localhost-only
+bind, no auth token — a trusted single-user dev box; any local process can
+drive the editor while it runs.
+
+The verbs span three areas: **level editing** (`import_t3d`/`export_t3d`/
+`rebuild_geometry`/`build`/`save_level`/`set_surface_material`/`list_actors`/
+`delete_actors`), **asset authoring** (`forge_chassis_physasset` physics assets;
+`create_blueprint`/`set_class_defaults`/`add_variable`/`import_graph`/
+`compile_blueprint`/`export_graph` for Blueprint mutators & gamemodes), and the
+raw `exec` escape hatch. Asset-authoring verbs touch packages, not the level.
 
 | Verb | What it does |
 |---|---|
-| `ping` / `status` | engine version, current map, dirty flag, actor count, build-running flag |
-| `preload_assets` | `StaticLoadObject` each path — **this retires the material-preloader hack** and makes BP actors (lifts, pickups), sounds and damage types resolve on a fresh level |
-| `import_t3d` | `edactPasteSelected` with an in-memory buffer (no clipboard) + the editor's own post-import fixups; returns created actors |
-| `export_t3d` | whole level (or selection) back as T3D — the read-back half of the loop |
+| `ping` / `status` | engine version, current map, dirty + locked flags, actor count, `pie_active`, and build flags — poll `lighting_building` for Lightmass, `editor_building` for other builds |
+| `preload_assets` | `StaticLoadObject` each path, **pinned against GC** via FGCObject — retires the material-preloader hack and makes BP actors (lifts, pickups), sounds and damage types resolve on a fresh level |
+| `import_t3d` | `edactPasteSelected` with an in-memory buffer (no clipboard) + the editor's own post-import fixups; errors if nothing imports; new actors stay selected (paste UX) |
+| `export_t3d` | current level (or selection) back as T3D — the read-back half of the loop; prior selection restored |
 | `rebuild_geometry` | `MAP REBUILD ALLVISIBLE` (the real CSG path; `BSP`/`LIGHT` exec are deprecated no-ops in 4.15) |
-| `build` | lighting / geometry / paths / all via `FEditorBuildUtils`; async — poll `status` |
-| `save_level` | `FEditorFileUtils::SaveLevel`; pass `filename` for never-saved levels |
-| `set_surface_material` | direct `Surfs[i].Material` + `polyUpdateMaster` (selection-independent, survives CSG rebuild); filter by brush name and/or face normal |
-| `list_actors` / `delete_actors` | query + clear for iterative re-import |
+| `build` | lighting / geometry / paths / all via `FEditorBuildUtils`; lighting is async (poll `status`), explicit nav builds are synchronous in 4.15 |
+| `save_level` | `FEditorFileUtils::SaveLevel`; never-saved levels need `filename` (fails fast instead of blocking on the modal Save As) |
+| `set_surface_material` | direct `Surfs[i].Material` + `ModifySurf` + `polyUpdateMaster` (selection-independent, survives CSG rebuild, undoable); filter by brush name and/or face normal |
+| `list_actors` / `delete_actors` | query + clear for iterative re-import — **current level scope** (actor names are only unique per level); builder brush/WorldSettings protected, locked levels rejected |
 | `exec` | raw `GEditor->Exec` escape hatch, output captured |
+| `forge_chassis_physasset` | asset authoring (not level): duplicate a skeletal mesh's default `UPhysicsAsset`, keep only one bone's body, drop the rest + all constraints, save the result — clean chassis-only asset for UTVehicles `PhysicsAssetOverride`. Never mutates the source or the mesh |
+| `create_blueprint` | asset authoring: `FKismetEditorUtilities::CreateBlueprint` a subclass of a native/BP parent (e.g. `AUTMutator`), compile, save. **Tier-1 BP authoring** |
+| `set_class_defaults` | write CDO property defaults on a Blueprint class (compile → `GeneratedClass` CDO → `UProperty::ImportText` → save); inherited mutator/gamemode props are valid targets — the config-variant path, no graph |
+| `add_variable` | `FBlueprintEditorUtils::AddMemberVariable` — scalar/object/class/struct types (+`[]`); needed before importing a graph that references the var by self-context |
+| `import_graph` | `FEdGraphUtilities::ImportNodesFromText` into the event/function graph + the editor's post-paste fix-up. **Tier-2 graph authoring** (clipboard-text) |
+| `compile_blueprint` | `CompileBlueprint` + node-level error/warning report (`bHasCompilerMessage`/`ErrorType`/`ErrorMsg`); import success ≠ validity, so always compile |
+| `export_graph` | `FEdGraphUtilities::ExportNodesToText` of a graph — read-back + the way to capture graph fixtures from a real Blueprint |
 
-The MCP proxy exposes these as `bridge_*` tools plus **`forge_mapspec`** — the
-one-shot MapSpec → preload → import → CSG rebuild loop, no paste, no preloader
-cubes (`emit.emit(..., loaders=False)`).
+Limits: 4 clients, 64 MiB per request line, bounded per-tick socket work — a
+wedged or hostile local client gets dropped, never a frozen editor. Regression
+suite: `python Tools/mapgen/tests/bridge_smoke.py` against a running editor.
+
+The MCP proxy exposes these as `bridge_*` tools plus one-shot convenience tools:
+**`forge_mapspec`** (MapSpec → preload → import → CSG rebuild, no paste/preloader
+cubes via `emit.emit(..., loaders=False)`), **`forge_bp_variant`** (create BP +
+set CDO defaults), and **`forge_bp_graph`** (create BP → add vars → re-home graph
+text → import → compile; `rehome_graph_text` repoints owning-class refs into the
+new class). Blueprint graph fixtures are captured from real BPs via `export_graph`,
+never hand-authored — see `Tools/mapgen/capture/fixtures/README.md`.
 
 Build (from the UT4 fork root; **unset `VULKAN_SDK`** — a modern Vulkan SDK
 breaks 4.15's VulkanRHI, and without the env var the engine uses its bundled

@@ -398,8 +398,9 @@ def emit(spec, actors=True, loaders=True):
                         m.get("material")))
         for i, jp in enumerate(spec.get("jumpPads", [])):
             body.append(jump_pad("JumpPad_%d" % i, jp["location"], jp["target"]))
-    loaders = [material_loader("MatLoad_%d" % i, m) for i, m in enumerate(sorted(u for u in used_mats if u))]
-    return "Begin Map\n   Begin Level\n" + "\n".join(loaders + body) + "\n   End Level\nEnd Map\n"
+    loader_actors = [material_loader("MatLoad_%d" % i, m)
+                     for i, m in enumerate(sorted(u for u in used_mats if u))] if loaders else []
+    return "Begin Map\n   Begin Level\n" + "\n".join(loader_actors + body) + "\n   End Level\nEnd Map\n"
 
 def emit_smoke_cube():
     b = box_brush("SmokeCube", (-256, -256, 0), (256, 256, 512))
