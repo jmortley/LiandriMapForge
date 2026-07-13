@@ -1732,18 +1732,7 @@
       "yaw": 135
     }
   ],
-  "lights": [
-    {
-      "type": "directional",
-      "pitch": -52,
-      "yaw": -35,
-      "intensity": 8
-    },
-    {
-      "type": "sky",
-      "intensity": 2.0
-    }
-  ],
+  "lights": [],
   "source": {
     "layout": "capture/rankin.png",
     "notes": "Auto-traced silhouette @ 40 cells, 269uu/cell. Flat: footprint faithful, no elevation."

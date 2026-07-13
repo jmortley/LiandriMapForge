@@ -41,18 +41,38 @@ MESHES = {
 
 # ---- material palette (mined from DM-Solo). Real ShellResources materials, so
 # generated surfaces read as UT4 instead of default checker. ----
-_M = "/Game/RestrictedAssets/Environments/ShellResources/Materials/"
-MAT_FLOOR = _M + "Industrial/M_Shell_IND_Ribbed.M_Shell_IND_Ribbed"
-MAT_WALL  = _M + "Tech/M_Shell_City_Wall_B.M_Shell_City_Wall_B"  # 696 uses in DM-Solo
-MAT_CEIL  = _M + "Tech/M_Shell_City_Wall_A.M_Shell_City_Wall_A"
+_M  = "/Game/RestrictedAssets/Environments/ShellResources/Materials/"
+_ML = "/Game/RestrictedAssets/Environments/Liandri/Materials/"
+_MB = "/Game/RestrictedAssets/Environments/Materials/"
+
+# Art profiles: real material palettes mined from shipped maps. Pick per map via
+# spec defaults.artProfile. This is the "deck/solo art as defaults" system.
+PROFILES = {
+    "solo": {  # DM-Solo -- ShellResources tech (grey panels)
+        "floor": _M + "Industrial/M_Shell_IND_Floor_A.M_Shell_IND_Floor_A",
+        "wall":  _M + "Tech/M_Shell_City_Wall_B.M_Shell_City_Wall_B",
+        "ceil":  _M + "Tech/M_Shell_City_Wall_A.M_Shell_City_Wall_A",
+    },
+    "deck": {  # DM-Deck -- Liandri concrete + orange
+        "floor": _MB + "Blank_concrete2.Blank_concrete2",
+        "wall":  _ML + "M_ConcreteWall.M_ConcreteWall",
+        "ceil":  _ML + "M_ConcreteWall_Dark.M_ConcreteWall_Dark",
+    },
+}
+DEFAULT_PROFILE = "deck"
+SLUDGE_MAT = _MB + "SlimePit.SlimePit"   # real DM-Deck sludge material
+
+# brush-name prefixes that denote a walkable (floor) surface across our builders
+_FLOOR_PREFIXES = ("floor", "spine", "walk", "bridge", "end_", "up_", "cat", "tower", "pit_floor", "stair")
 
 def brush_material(name, defaults):
-    """Pick a material by the brush's role (floor/ceiling/wall). Spec defaults win."""
-    if name.startswith("floor"):
-        return defaults.get("floorMaterial") or MAT_FLOOR
+    """Pick a material by the brush's role, from the chosen art profile. Spec defaults win."""
+    prof = PROFILES.get(defaults.get("artProfile", DEFAULT_PROFILE), PROFILES[DEFAULT_PROFILE])
     if name.startswith("ceil"):
-        return defaults.get("ceilingMaterial") or MAT_CEIL
-    return defaults.get("wallMaterial") or MAT_WALL
+        return defaults.get("ceilingMaterial") or prof["ceil"]
+    if name.startswith(_FLOOR_PREFIXES):
+        return defaults.get("floorMaterial") or prof["floor"]
+    return defaults.get("wallMaterial") or prof["wall"]
 
 # ---- formatting -------------------------------------------------------------
 
@@ -224,6 +244,8 @@ def directional_light(name, pitch, yaw, intensity):
         "            Mobility=Movable",
         "            LightGuid=%s" % guid(name),
         "            Intensity=%.6f" % intensity,
+        "            LightColor=(B=200,G=225,R=249,A=255)",       # warm sun, from DM-Solo
+        "            IndirectLightingIntensity=5.000000",
         "            RelativeRotation=(Pitch=%.6f,Yaw=%.6f,Roll=0.000000)" % (pitch, yaw),
         "         End Object",
         "         LightComponent=LightComponent0",
@@ -245,6 +267,39 @@ def sky_light(name, intensity):
         "         End Object",
         "         LightComponent=SkyLightComponent0",
         "         RootComponent=SkyLightComponent0",
+        '         ActorLabel="%s"' % name,
+        "      End Actor",
+    ])
+
+def atmospheric_fog(name):
+    # Gives the SkyLight a bright sky to capture -> real ambient fill (no bake).
+    return "\n".join([
+        "      Begin Actor Class=AtmosphericFog Name=%s Archetype=AtmosphericFog'/Script/Engine.Default__AtmosphericFog'" % name,
+        '         Begin Object Class=AtmosphericFogComponent Name="AtmosphericFogComponent0" Archetype=AtmosphericFogComponent\'Default__AtmosphericFog:AtmosphericFogComponent0\'',
+        "         End Object",
+        '         Begin Object Name="AtmosphericFogComponent0"',
+        "            RelativeLocation=(X=0.000000,Y=0.000000,Z=0.000000)",
+        "         End Object",
+        "         AtmosphericFogComponent=AtmosphericFogComponent0",
+        "         RootComponent=AtmosphericFogComponent0",
+        '         ActorLabel="%s"' % name,
+        "      End Actor",
+    ])
+
+def jump_pad(name, loc, target):
+    # BaseJumpPad_C (root SceneComponent). `target` is the RELATIVE launch destination
+    # offset; the BP computes arc velocity from it. Serialization from a real map dump;
+    # BP-construction-dependent, so verify on first paste.
+    x, y, z = loc
+    tx, ty, tz = target
+    return "\n".join([
+        "      Begin Actor Class=BaseJumpPad_C Name=%s Archetype=BaseJumpPad_C'/Game/RestrictedAssets/Blueprints/JumpPad/BaseJumpPad.Default__BaseJumpPad_C'" % name,
+        '         Begin Object Name="SceneComponent"',
+        "            RelativeLocation=%s" % p(x, y, z),
+        "         End Object",
+        "         JumpTarget=(X=%.6f,Y=%.6f,Z=%.6f)" % (tx, ty, tz),
+        "         JumpTime=1.200000",
+        "         RootComponent=SceneComponent",
         '         ActorLabel="%s"' % name,
         "      End Actor",
     ])
@@ -291,6 +346,12 @@ def static_mesh_actor(name, mesh, loc, rot=(0, 0, 0), scale=(1, 1, 1), material=
     ]
     return "\n".join(lines)
 
+def material_loader(name, mat):
+    """Tiny hidden mesh far below the map whose OverrideMaterials force-loads `mat`.
+    Pasted BSP only resolves already-loaded materials, so without these the surfaces
+    fall back to checker in a fresh level. Emitted BEFORE the brushes."""
+    return static_mesh_actor(name, "cube", [0.0, 0.0, -9000.0], scale=(0.02, 0.02, 0.02), material=mat)
+
 # ---- assembly ---------------------------------------------------------------
 
 def _defaults(spec):
@@ -302,23 +363,28 @@ def emit(spec, actors=True):
     d = _defaults(spec)
     dm = spec.get("defaults", {})
     body = []
+    used_mats = set()
     for room in spec.get("rooms", []):
         for (name, mn, mx) in room_boxes(room, d, spec.get("doorways", [])):
-            body.append(box_brush(name, mn, mx, brush_material(name, dm)))
+            mat = brush_material(name, dm); used_mats.add(mat)
+            body.append(box_brush(name, mn, mx, mat))
     # raw additive boxes -- freeform tracing of an arbitrary floorplan
     for b in spec.get("brushes", []):
-        body.append(box_brush(b["name"], b["min"], b["max"], b.get("material") or brush_material(b["name"], dm)))
+        mat = b.get("material") or brush_material(b["name"], dm); used_mats.add(mat)
+        body.append(box_brush(b["name"], b["min"], b["max"], mat))
     if actors:
         for i, ps in enumerate(spec.get("playerStarts", [])):
             body.append(player_start("UTPlayerStart_%d" % i, ps["location"], ps.get("yaw", 0)))
+        # Always-on environment rig (sun + sky + fog), calibrated to DM-Solo, so
+        # generated maps are never dark. Overridable/disable via spec["environment"].
+        env = spec.get("environment", {})
+        if env.get("enabled", True):
+            body.append(directional_light("Sun", env.get("sunPitch", -46.0), env.get("sunYaw", -35.0), env.get("sunIntensity", 6.0)))
+            body.append(sky_light("Sky", env.get("skyIntensity", 3.0)))
+            body.append(atmospheric_fog("Atmos"))
+        # spec.lights = optional point-light accents layered on top of the rig
         for i, lt in enumerate(spec.get("lights", [])):
-            kind = lt.get("type", "point")
-            if kind == "directional":
-                body.append(directional_light("DirectionalLight_%d" % i,
-                            lt.get("pitch", -50), lt.get("yaw", -35), lt.get("intensity", 6)))
-            elif kind == "sky":
-                body.append(sky_light("SkyLight_%d" % i, lt.get("intensity", 1.5)))
-            else:
+            if lt.get("type", "point") == "point":
                 body.append(point_light("PointLight_%d" % i, lt["location"],
                             lt.get("intensity", 5000), lt.get("radius", 1024)))
         for i, pk in enumerate(spec.get("pickups", [])):
@@ -327,7 +393,10 @@ def emit(spec, actors=True):
             body.append(static_mesh_actor("SM_%d" % i, m["mesh"], m["location"],
                         tuple(m.get("rotation", [0, 0, 0])), tuple(m.get("scale", [1, 1, 1])),
                         m.get("material")))
-    return "Begin Map\n   Begin Level\n" + "\n".join(body) + "\n   End Level\nEnd Map\n"
+        for i, jp in enumerate(spec.get("jumpPads", [])):
+            body.append(jump_pad("JumpPad_%d" % i, jp["location"], jp["target"]))
+    loaders = [material_loader("MatLoad_%d" % i, m) for i, m in enumerate(sorted(u for u in used_mats if u))]
+    return "Begin Map\n   Begin Level\n" + "\n".join(loaders + body) + "\n   End Level\nEnd Map\n"
 
 def emit_smoke_cube():
     b = box_brush("SmokeCube", (-256, -256, 0), (256, 256, 512))
@@ -337,11 +406,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("spec")
     ap.add_argument("--out", default="out")
+    ap.add_argument("--profile", default=None, help="override art profile (solo|deck); suffixes the output name")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     with open(args.spec, encoding="utf-8") as f:
         spec = json.load(f)
     name = spec.get("name", "map")
+    if args.profile:
+        spec.setdefault("defaults", {})["artProfile"] = args.profile
+        name = "%s_%s" % (name, args.profile)
 
     d = _defaults(spec)
     nbrush = sum(len(room_boxes(r, d, spec.get("doorways", []))) for r in spec.get("rooms", [])) + len(spec.get("brushes", []))

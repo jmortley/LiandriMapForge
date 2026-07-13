@@ -131,10 +131,7 @@ def main():
         "defaults": {"wallHeight": a.wall_height, "wallThickness": 32, "floorThickness": a.floor_thick},
         "brushes": brushes,
         "playerStarts": starts,
-        "lights": [
-            {"type": "directional", "pitch": -52, "yaw": -35, "intensity": 8},
-            {"type": "sky", "intensity": 2.0},
-        ],
+        "lights": [],
         "source": {"layout": a.image,
                    "notes": "Auto-traced silhouette @ %d cells, %.0fuu/cell. Flat: footprint faithful, no elevation." % (C, S)},
     }
