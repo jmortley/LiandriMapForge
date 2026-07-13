@@ -188,7 +188,9 @@ def bridge_export_t3d(selected_only: bool = False, save_to: str = "") -> dict:
     path + length instead of the full text."""
     result = _bridge_call("export_t3d", {"selected_only": selected_only})
     if save_to:
-        with open(save_to, "w", encoding="utf-8") as f:
+        # newline="" -- the T3D already carries \r\n; text-mode translation
+        # would double it to \r\r\n
+        with open(save_to, "w", encoding="utf-8", newline="") as f:
             f.write(result.pop("t3d"))
         result["saved_to"] = save_to
     return result
