@@ -85,6 +85,74 @@ def test_persistent_connection():
     print("persistent connection: OK")
 
 
+def test_static_mesh():
+    """Import the tiny OBJ fixture, check stats + complex-as-simple collision,
+    place it at identity, and exercise the validation + exec-hardening rejects.
+    Non-destructive: the asset is imported in-memory (save=False) to a dedicated
+    /Game/Developers path and the placed actor is deleted; the level is never
+    saved. The big Andok OBJ is intentionally NOT used here."""
+    fixtures = os.path.join(HERE, "fixtures")
+    obj = os.path.join(fixtures, "tiny_mesh.obj").replace("\\", "/")
+    mtl = os.path.join(fixtures, "tiny_mesh.mtl").replace("\\", "/")
+    dest = "/Game/Developers/MapForgeSmoke"
+    name = "SM_MapForgeSmoke"
+
+    # validation rejects (before any editor mutation)
+    expect_error("import_static_mesh",
+                 {"source": "C:/nope/does_not_exist.obj", "destination": dest, "name": name},
+                 "not found")
+    expect_error("import_static_mesh",
+                 {"source": mtl, "destination": dest, "name": name},
+                 "unsupported extension")
+    expect_error("import_static_mesh",
+                 {"source": obj, "destination": "/Engine/Foo", "name": name},
+                 "/game")
+    print("import validation rejects: OK")
+
+    # successful import (in-memory; save=False keeps the disk clean)
+    imp = call("import_static_mesh", {
+        "source": obj, "destination": dest, "name": name,
+        "overwrite": True, "save": False,
+        "options": {"combine_meshes": True, "import_materials": False,
+                    "import_textures": False, "generate_lightmap_uvs": True,
+                    "compute_normals": True, "use_mikk_tspace": False,
+                    "collision": "complex_as_simple", "lightmap_coordinate_index": 1},
+    })
+    assert imp["material_slot_count"] >= 1, imp
+    assert imp["lod0_triangles"] == 2, imp
+    assert imp["lod0_vertices"] > 0, imp
+    assert imp["uv_channels"] >= 1, imp
+    assert imp["collision_trace_mode"] == "complex_as_simple", imp
+    assert imp["simple_collision_primitives"] == 0, imp
+    asset = imp["asset"]
+    print("import + stats + complex_as_simple: OK (%d tris, %d slot(s), %d uv ch)"
+          % (imp["lod0_triangles"], imp["material_slot_count"], imp["uv_channels"]))
+
+    # overwrite gate (the asset now exists in memory)
+    expect_error("import_static_mesh",
+                 {"source": obj, "destination": dest, "name": name,
+                  "overwrite": False, "save": False},
+                 "already exists")
+    imp2 = call("import_static_mesh",
+                {"source": obj, "destination": dest, "name": name,
+                 "overwrite": True, "save": False})
+    assert imp2["overwritten"] is True, imp2
+    print("overwrite reject / allow: OK")
+
+    # placement at identity, then clean up the actor (never save the level)
+    placed = call("place_static_mesh", {"asset": asset, "label": "SM_MapForgeSmoke_Placed"})
+    loc, sc = placed["transform"]["location"], placed["transform"]["scale"]
+    assert abs(loc["x"]) < 1e-3 and abs(loc["y"]) < 1e-3 and abs(loc["z"]) < 1e-3, placed
+    assert abs(sc["x"] - 1.0) < 1e-3 and abs(sc["z"] - 1.0) < 1e-3, placed
+    print("place at identity: OK (%s)" % placed["label"])
+    call("delete_actors", {"names": [placed["actor"]]})
+
+    # exec hardening: dangerous families rejected before GEditor->Exec
+    expect_error("exec", {"command": 'MAP LOAD FILE="X.umap"'}, "blocked")
+    expect_error("exec", {"command": "OBJ IMPORT FILE=x.obj NAME=y"}, "blocked")
+    print("exec MAP LOAD / OBJ IMPORT rejection: OK")
+
+
 def main():
     status = wait_for_bridge()
     print("PING:", json.dumps(status))
@@ -143,6 +211,8 @@ def main():
     box_refs = mcp_mod._asset_refs(t3d)
     assert any("/Game/" in r for r in box_refs), "bare Texture= refs not harvested"
     print("loaders=False + bare-ref harvest: OK (%d refs)" % len(box_refs))
+
+    test_static_mesh()
 
     # Clean up everything this test created.
     to_delete = cube_names + [a["name"] for a in imp2["actors"]]

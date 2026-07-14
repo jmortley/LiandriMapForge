@@ -129,10 +129,39 @@ Smoke (after build + editor restart):
   → expect compiled.status up_to_date (add its self-context vars via `variables=[...]`
   if any). See `capture/fixtures/README.md` for capture guidance.
 
+Also uncommitted: **static mesh import/configure/place + exec hardening**. Bridge
+verbs `import_static_mesh`, `configure_static_mesh`, `place_static_mesh` (+ MCP
+`bridge_import_static_mesh`/`bridge_configure_static_mesh`/`bridge_place_static_mesh`).
+Import path = `IAssetTools::ImportAssetsAutomated(const UAutomatedAssetImportData&)`
+driving a configured `UFbxFactory` — **no dialog, no Exec, no OBJ IMPORT**; `.obj`
+rides the same factory as `.fbx` (`FbxFactory.cpp:33` registers `obj`→`UStaticMesh`;
+there is no `UStaticMeshFactory`). Verified-in-tree API notes: `ImportAssetsAutomated`
+is `const&`→`TArray<UObject*>` (IAssetTools.h:158); `bCombineMeshes` is on
+`UFbxImportUI` not the import data; dialog gated on `IsAutomatedImport()`
+(Factory.h:175); config uses `StaticMaterials`/`BodySetupEnums.h` (`CTF_UseComplexAsSimple`,
+note different value order — named enums only)/`SourceModels[0].BuildSettings`/guarded
+`RenderData`. Asset named exactly via a temp-copy staged as `<name>.<ext>`
+(`FPaths::GameIntermediateDir()` — 4.15 name). Build.cs adds only `AssetTools`
+(include-path + dynamically-loaded, per ContentBrowser precedent). All three verbs
+in `IsMutatingCmd`; import/place never save the level.
+
+`exec` hardened with a blocklist (`IsDangerousExecCommand`): `MAP LOAD/NEW/IMPORT`,
+`OBJ IMPORT/LOAD`, `QUIT/EXIT` rejected *before* `GEditor->Exec` — the `MAP LOAD`
+of a bad `.umap` OOM-crashed the editor and fatal engine failures can't be caught
+in C++. `rebuild_geometry`/`save_level` keep their own dedicated paths (not routed
+through `exec`), so they're unaffected.
+
+Smoke (after build + editor restart): `python Tools/mapgen/tests/bridge_smoke.py`
+covers import/stats/complex-as-simple/place-at-identity/overwrite/validation +
+exec rejects against the tiny OBJ fixture (`tests/fixtures/tiny_mesh.obj`).
+**Manual acceptance** (not in the suite): import
+`C:\Users\MrJmo\Documents\Codex\2026-07-13\...\SM_DM_Andok_Scaled_BSP_Recovered_UE4_UV.obj`
+with combine_meshes/generate_lightmap_uvs/compute_normals on, MikkTSpace off,
+auto simple collision off, collision=complex_as_simple, then place at identity.
+
 Deferred (unchanged): structure recognition (geometry-graph semantic labels,
 lift lift-and-shift, ramp-from-slope).
 
-Working state note: bridge v1 is committed/pushed (`b29ce7b`); the audit-fix
-batch (server rewrite + Python fixes + fixtures + tests/bridge_smoke.py) plus
-the `forge_chassis_physasset` verb are **uncommitted pending phantaci's build +
-smoke test**.
+Working state note: bridge v2 is committed/pushed (`1b2e1ec`: audit hardening +
+physics-asset forge + Blueprint Tiers 1–2). The **static-mesh import + exec
+hardening** batch above is uncommitted, pending phantaci's build + smoke test.

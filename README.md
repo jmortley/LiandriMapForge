@@ -79,10 +79,11 @@ drive the editor while it runs.
 
 The verbs span three areas: **level editing** (`import_t3d`/`export_t3d`/
 `rebuild_geometry`/`build`/`save_level`/`set_surface_material`/`list_actors`/
-`delete_actors`), **asset authoring** (`forge_chassis_physasset` physics assets;
-`create_blueprint`/`set_class_defaults`/`add_variable`/`import_graph`/
-`compile_blueprint`/`export_graph` for Blueprint mutators & gamemodes), and the
-raw `exec` escape hatch. Asset-authoring verbs touch packages, not the level.
+`delete_actors`/`place_static_mesh`), **asset authoring** (`forge_chassis_physasset`
+physics assets; `create_blueprint`/`set_class_defaults`/`add_variable`/`import_graph`/
+`compile_blueprint`/`export_graph` for Blueprint mutators & gamemodes;
+`import_static_mesh`/`configure_static_mesh` for meshes), and the restricted
+`exec` escape hatch. Asset-authoring verbs touch packages, not the level.
 
 | Verb | What it does |
 |---|---|
@@ -95,7 +96,7 @@ raw `exec` escape hatch. Asset-authoring verbs touch packages, not the level.
 | `save_level` | `FEditorFileUtils::SaveLevel`; never-saved levels need `filename` (fails fast instead of blocking on the modal Save As) |
 | `set_surface_material` | direct `Surfs[i].Material` + `ModifySurf` + `polyUpdateMaster` (selection-independent, survives CSG rebuild, undoable); filter by brush name and/or face normal |
 | `list_actors` / `delete_actors` | query + clear for iterative re-import — **current level scope** (actor names are only unique per level); builder brush/WorldSettings protected, locked levels rejected |
-| `exec` | raw `GEditor->Exec` escape hatch, output captured |
+| `exec` | restricted `GEditor->Exec` escape hatch, output captured. **Blocklisted:** `MAP LOAD`/`MAP NEW`/`MAP IMPORT`, `OBJ IMPORT`/`OBJ LOAD`, and `QUIT`/`EXIT` are rejected *before* Exec — a bad `MAP LOAD` of an incompatible `.umap` fatally OOM-crashed the editor, and fatal engine failures can't be caught in C++, so they're prevented. Use dedicated verbs (`import_t3d`, `import_static_mesh`) instead |
 | `forge_chassis_physasset` | asset authoring (not level): duplicate a skeletal mesh's default `UPhysicsAsset`, keep only one bone's body, drop the rest + all constraints, save the result — clean chassis-only asset for UTVehicles `PhysicsAssetOverride`. Never mutates the source or the mesh |
 | `create_blueprint` | asset authoring: `FKismetEditorUtilities::CreateBlueprint` a subclass of a native/BP parent (e.g. `AUTMutator`), compile, save. **Tier-1 BP authoring** |
 | `set_class_defaults` | write CDO property defaults on a Blueprint class (compile → `GeneratedClass` CDO → `UProperty::ImportText` → save); inherited mutator/gamemode props are valid targets — the config-variant path, no graph |
@@ -103,10 +104,52 @@ raw `exec` escape hatch. Asset-authoring verbs touch packages, not the level.
 | `import_graph` | `FEdGraphUtilities::ImportNodesFromText` into the event/function graph + the editor's post-paste fix-up. **Tier-2 graph authoring** (clipboard-text) |
 | `compile_blueprint` | `CompileBlueprint` + node-level error/warning report (`bHasCompilerMessage`/`ErrorType`/`ErrorMsg`); import success ≠ validity, so always compile |
 | `export_graph` | `FEdGraphUtilities::ExportNodesToText` of a graph — read-back + the way to capture graph fixtures from a real Blueprint |
+| `import_static_mesh` | import a `.obj`/`.fbx` as a `UStaticMesh` via the automated `UFbxFactory` (no dialog, no Exec); static-mesh-only, no materials by default, combine on; configures collision + lightmap + returns full mesh stats. `.obj`/`.fbx` only — never `.umap`/packages |
+| `configure_static_mesh` | set collision mode, clear simple collision, lightmap UV channel, and assign materials to explicit slots on an imported mesh; optional per-asset save |
+| `place_static_mesh` | spawn a `AStaticMeshActor` for a mesh into the current level at a transform (identity default), with label/folder; undoable, marks level dirty + redraws, **never saves the level** |
 
 Limits: 4 clients, 64 MiB per request line, bounded per-tick socket work — a
 wedged or hostile local client gets dropped, never a frozen editor. Regression
 suite: `python Tools/mapgen/tests/bridge_smoke.py` against a running editor.
+
+### Static mesh import
+
+`import_static_mesh` brings an OBJ or FBX in as a `UStaticMesh` through the
+editor's own automated `UFbxFactory` path (`.obj` is registered there too, so
+both extensions share one code path) — **no modal dialog, no `GEditor->Exec`,
+no `OBJ IMPORT`**. Request schema:
+
+```json
+{
+  "source": "C:\\absolute\\path\\mesh.obj",
+  "destination": "/Game/Developers/MrJmo/Recovered",
+  "name": "SM_RecoveredShell",
+  "overwrite": false,
+  "save": true,
+  "options": {
+    "combine_meshes": true, "import_materials": false, "import_textures": false,
+    "generate_lightmap_uvs": true, "compute_normals": true, "use_mikk_tspace": false,
+    "collision": "complex_as_simple", "lightmap_coordinate_index": 1
+  }
+}
+```
+
+Safety / behavior:
+- Validated **before** any editor mutation: `source` must be an existing
+  absolute `.obj`/`.fbx` file; `destination` a valid `/Game/…` folder (never
+  `/Engine`, `.umap`, or a package path); `name` is sanitized. Existing target
+  with `overwrite:false` fails cleanly — never a prompt.
+- The asset is named exactly `name` (a temp copy is staged, since the automated
+  importer names by filename). Materials/textures/skeletal/animation are off by
+  default; `collision:"complex_as_simple"` sets `CTF_UseComplexAsSimple` and
+  strips generated simple collision.
+- Importing a mesh **does not save the current map**. `place_static_mesh` spawns
+  an actor and marks the level dirty but likewise never saves it — save the
+  level yourself via `save_level` when ready.
+- MCP tools: `bridge_import_static_mesh`, `bridge_configure_static_mesh`,
+  `bridge_place_static_mesh`. The smoke test uses a tiny tracked OBJ fixture
+  (`tests/fixtures/tiny_mesh.obj`); the large Andok acceptance OBJ is exercised
+  manually, not in the automated suite.
 
 The MCP proxy exposes these as `bridge_*` tools plus one-shot convenience tools:
 **`forge_mapspec`** (MapSpec → preload → import → CSG rebuild, no paste/preloader

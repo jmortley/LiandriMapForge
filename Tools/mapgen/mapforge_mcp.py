@@ -418,5 +418,78 @@ def forge_bp_graph(parent: str, package: str, graph_t3d: str, variables: list = 
     return {"created": created, "variables": added, "imported": imported, "compiled": compiled}
 
 
+# ---- Static mesh import / configure / place ---------------------------------
+
+@mcp.tool()
+def bridge_import_static_mesh(source: str, destination: str, name: str = "",
+                              overwrite: bool = False, save: bool = True,
+                              options: dict = None) -> dict:
+    """Import an OBJ or FBX file as a UStaticMesh into the open editor -- no
+    modal dialog, no GEditor->Exec (uses the automated FBX/OBJ factory path).
+    'source' is an absolute local .obj/.fbx path; 'destination' a /Game content
+    folder; 'name' the asset name (defaults to the file's base name). 'options'
+    (all optional, with defaults): combine_meshes(true), import_materials(false),
+    import_textures(false), generate_lightmap_uvs(true), compute_normals(true),
+    use_mikk_tspace(false), collision ("none"|"simple"|"complex_as_simple"),
+    lightmap_coordinate_index(1). Fails cleanly (no prompt) if the target exists
+    and overwrite is false. Only .obj/.fbx are allowed -- never .umap/arbitrary
+    packages. Returns asset/package path, class, source, created/overwritten,
+    saved, and mesh stats (material_slot_count, lod0_vertices/triangles,
+    uv_channels, bounds, collision_trace_mode, simple_collision_primitives) plus
+    warnings. Importing a mesh does NOT save the current map."""
+    args = {"source": source, "destination": destination,
+            "overwrite": overwrite, "save": save}
+    if name:
+        args["name"] = name
+    if options:
+        args["options"] = options
+    return _bridge_call("import_static_mesh", args)
+
+
+@mcp.tool()
+def bridge_configure_static_mesh(asset: str, collision: str = "",
+                                 clear_simple_collision: bool = False,
+                                 lightmap_coordinate_index: int = None,
+                                 materials: dict = None, save: bool = False) -> dict:
+    """Reconfigure an imported UStaticMesh. 'collision' sets the trace mode
+    ("none"|"simple"|"complex_as_simple"); 'clear_simple_collision' strips
+    auto-generated simple primitives; 'lightmap_coordinate_index' sets the
+    lightmap UV channel (rebuilds the asset); 'materials' assigns material asset
+    paths to explicit slot indices, e.g. {"0": "/Game/.../M_Foo"}. save=True
+    writes the asset package. Returns updated mesh stats + warnings."""
+    args = {"asset": asset, "save": save}
+    if collision:
+        args["collision"] = collision
+    if clear_simple_collision:
+        args["clear_simple_collision"] = True
+    if lightmap_coordinate_index is not None:
+        args["lightmap_coordinate_index"] = lightmap_coordinate_index
+    if materials:
+        args["materials"] = materials
+    return _bridge_call("configure_static_mesh", args)
+
+
+@mcp.tool()
+def bridge_place_static_mesh(asset: str, location: list = None, rotation: list = None,
+                             scale: list = None, label: str = "", folder: str = "") -> dict:
+    """Spawn a StaticMeshActor for an imported mesh into the current editor
+    level. 'location' [x,y,z], 'rotation' [pitch,yaw,roll], 'scale' [x,y,z] each
+    default to identity (0/0/1). Optional actor 'label' and world-outliner
+    'folder'. Undoable; marks the level dirty and redraws viewports, but does
+    NOT save the level. Returns the actor name/label/path and final transform."""
+    args = {"asset": asset}
+    if location:
+        args["location"] = location
+    if rotation:
+        args["rotation"] = rotation
+    if scale:
+        args["scale"] = scale
+    if label:
+        args["label"] = label
+    if folder:
+        args["folder"] = folder
+    return _bridge_call("place_static_mesh", args)
+
+
 if __name__ == "__main__":
     mcp.run()

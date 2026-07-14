@@ -1,0 +1,16 @@
+# MapForgeBridge tiny import fixture: one quad, UVs, one material slot.
+# Small enough for the automated smoke test; NOT the Andok acceptance asset.
+mtllib tiny_mesh.mtl
+o TinyQuad
+v -50.0 -50.0 0.0
+v  50.0 -50.0 0.0
+v  50.0  50.0 0.0
+v -50.0  50.0 0.0
+vt 0.0 0.0
+vt 1.0 0.0
+vt 1.0 1.0
+vt 0.0 1.0
+vn 0.0 0.0 1.0
+usemtl M_Tiny
+f 1/1/1 2/2/1 3/3/1
+f 1/1/1 3/3/1 4/4/1

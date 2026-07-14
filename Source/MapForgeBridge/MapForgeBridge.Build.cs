@@ -20,6 +20,13 @@ namespace UnrealBuildTool.Rules
 				"Json",
 				"AssetRegistry"   // forge_chassis_physasset: AssetCreated notify
 			});
+
+			// import_static_mesh: IAssetTools is a runtime interface fetched via
+			// FModuleManager (no link dep) -- headers on the include path + module
+			// loaded dynamically, matching ContentBrowser.Build.cs. UnrealEd already
+			// provides UFbxFactory / UFbxImportUI / UAutomatedAssetImportData.
+			PrivateIncludePathModuleNames.AddRange(new string[] { "AssetTools" });
+			DynamicallyLoadedModuleNames.AddRange(new string[] { "AssetTools" });
 		}
 	}
 }

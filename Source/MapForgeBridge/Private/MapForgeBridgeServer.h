@@ -104,6 +104,9 @@ private:
 	TSharedPtr<FJsonObject> CmdImportGraph(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdCompileBlueprint(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdExportGraph(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	TSharedPtr<FJsonObject> CmdImportStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	TSharedPtr<FJsonObject> CmdConfigureStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	TSharedPtr<FJsonObject> CmdPlaceStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 
 	FSocket* ListenSocket;
 	TArray<FMapForgeClient> Clients;
