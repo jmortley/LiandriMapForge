@@ -141,9 +141,18 @@ is `const&`→`TArray<UObject*>` (IAssetTools.h:158); `bCombineMeshes` is on
 (Factory.h:175); config uses `StaticMaterials`/`BodySetupEnums.h` (`CTF_UseComplexAsSimple`,
 note different value order — named enums only)/`SourceModels[0].BuildSettings`/guarded
 `RenderData`. Asset named exactly via a temp-copy staged as `<name>.<ext>`
-(`FPaths::GameIntermediateDir()` — 4.15 name). Build.cs adds only `AssetTools`
-(include-path + dynamically-loaded, per ContentBrowser precedent). All three verbs
-in `IsMutatingCmd`; import/place never save the level.
+(`FPaths::GameIntermediateDir()` — 4.15 name). **Multi-material OBJs:** each
+`mtllib` `.mtl` sidecar the OBJ names is staged next to the temp copy under its
+referenced name (`FFileHelper::LoadFileToString` + per-line `ParseIntoArrayWS`,
+OBJ-only — FBX embeds materials), so `usemtl` groups map to distinct slots.
+Without the sidecar the FBX SDK reports 0 materials and forces one slot
+(`FbxStaticMeshImport.cpp:297,325` — `MaterialCount = Node->GetMaterialCount()`
+then the `MaterialCount==0` default-slot branch); slot count is **independent of
+`import_materials`**, which only controls UMaterial-asset creation. All staged
+temp files are tracked and deleted post-import; missing/unsafe sidecars go to the
+result `warnings`. Build.cs adds only `AssetTools` (include-path +
+dynamically-loaded, per ContentBrowser precedent). All three verbs in
+`IsMutatingCmd`; import/place never save the level.
 
 `exec` hardened with a blocklist (`IsDangerousExecCommand`): `MAP LOAD/NEW/IMPORT`,
 `OBJ IMPORT/LOAD`, `QUIT/EXIT` rejected *before* `GEditor->Exec` — the `MAP LOAD`
@@ -153,15 +162,68 @@ through `exec`), so they're unaffected.
 
 Smoke (after build + editor restart): `python Tools/mapgen/tests/bridge_smoke.py`
 covers import/stats/complex-as-simple/place-at-identity/overwrite/validation +
-exec rejects against the tiny OBJ fixture (`tests/fixtures/tiny_mesh.obj`).
+exec rejects against the tiny OBJ fixture (`tests/fixtures/tiny_mesh.obj`), plus a
+two-`usemtl` cube (`tests/fixtures/cube_two_materials.obj`) asserting
+`material_slot_count == 2` — the MTL-sidecar-staging regression guard.
 **Manual acceptance** (not in the suite): import
 `C:\Users\MrJmo\Documents\Codex\2026-07-13\...\SM_DM_Andok_Scaled_BSP_Recovered_UE4_UV.obj`
 with combine_meshes/generate_lightmap_uvs/compute_normals on, MikkTSpace off,
 auto simple collision off, collision=complex_as_simple, then place at identity.
+
+Also uncommitted: **map-scoped recovery layout + read-only actor audit**. Makes a
+per-map layout the default for every recovery so two maps sharing asset names
+never collide. Two roots, hard-separated:
+- **Editable content** under `<RecoveryRoot>/<MapSlug>/` (default
+  `/Game/RecoveredMaps`): `Maps/`, `Geometry/BSP`, `Geometry/StaticMeshes`,
+  `Materials/`, `Textures/`, `VFX/`, `Audio/`, `Blueprints/`, `Data/`.
+- **Non-content** under `Saved/LiandriMapForge/Recoveries/<MapSlug>/`:
+  `RawExtract/` (preserves original `Content/…` hierarchy — extracted
+  `/Game/RestrictedAssets/…` never flattened/moved), `Interchange/`, `Manifests/`,
+  `Reports/`. Stock `/Game`/`/Engine` never moved; only regenerated assets go
+  under the recovery root.
+
+New **read-only** verbs (deliberately NOT in `IsMutatingCmd`): `recovery_layout`
+(resolve content + Saved paths; `map_name` inferred from current map short name
+with recovery suffixes stripped when omitted — inference-only) and
+`inspect_static_mesh_actors` (per-`AStaticMeshActor`: mesh-or-null, actor +
+component transform, hidden/visible, mobility, collision, material overrides by
+slot; summary counts; name/folder filters + offset/limit; excludes pending-kill;
+**never dirties the map** — verified in-tree: `AActor::GetActorLabel() const`
+returns `const FString&` [no lazy create], `GetFolderPath`/`IsHiddenEd`,
+`UStaticMeshComponent::GetStaticMesh`/`GetRelativeTransform`/`Mobility`/
+`GetCollisionEnabled`/`OverrideMaterials`, `EComponentMobility`/`ECollisionEnabled`).
+Root config: default `/Game/RecoveredMaps`, `[MapForgeBridge] RecoveryRoot=` ini,
+`MAPFORGE_RECOVERY_ROOT` env in the MCP (forwarded to the bridge — single
+resolver, so both agree). Slug sanitized to `[A-Za-z0-9_-]`; traversal / path
+separators / `/Engine` root / invalid package paths rejected.
+
+`import_static_mesh` `destination` is now **optional**: omit it + pass
+`map_name`/`category` (default `Geometry/StaticMeshes`, only canonical categories
+accepted) to resolve `<root>/<slug>/<category>`; explicit `destination` unchanged.
+Result echoes the resolved `destination` + `recovery_layout`.
+
+MCP helpers: `bridge_recovery_layout`, `bridge_inspect_static_mesh_actors`,
+`write_recovery_manifest` (atomic JSON via tempfile+`os.replace` to
+`…/Manifests/recovery_manifest.json`, never in Content; records source PAK/map,
+layout, imported assets, source SHA-256s, material substitutions, actor counts,
+warnings, UTC timestamp, engine version), and `audit_static_mesh_actors`
+(compares live inspect vs `actors_manifest.json` → missing/extra/null/
+substituted/transform-mismatch/missing-override; pure `_diff_actors` unit-tested).
+
+Tests: `tests/test_recovery_offline.py` (pure `_diff_actors`/`_transform_close`/
+atomic-write, no editor — run now: **passes**) + `test_recovery()` in
+`bridge_smoke.py` (layout derivation/stability/suffix rules, two-map separation,
+traversal+`/Engine` rejects, default StaticMeshes/BSP destinations, inspect
+no-dirty, live audit substitution+missing). New fixture `traversal_mtllib.obj`
+(mtllib `../` → rejected, 1 slot + warning).
 
 Deferred (unchanged): structure recognition (geometry-graph semantic labels,
 lift lift-and-shift, ramp-from-slope).
 
 Working state note: bridge v2 is committed/pushed (`1b2e1ec`: audit hardening +
 physics-asset forge + Blueprint Tiers 1–2). The **static-mesh import + exec
-hardening** batch above is uncommitted, pending phantaci's build + smoke test.
+hardening** batch (now including **MTL-sidecar staging**) and the **map-scoped
+recovery layout + actor audit** batch above are uncommitted, pending phantaci's
+build + smoke test (then re-run the 14-material Andok acceptance OBJ, confirm all
+14 slots, and drive a real recovery through `recovery_layout` +
+`write_recovery_manifest` + `audit_static_mesh_actors`).

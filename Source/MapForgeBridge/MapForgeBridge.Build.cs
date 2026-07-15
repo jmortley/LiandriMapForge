@@ -15,6 +15,7 @@ namespace UnrealBuildTool.Rules
 				"CoreUObject",
 				"Engine",
 				"UnrealEd",
+				"AudioEditor",
 				"Networking",
 				"Sockets",
 				"Json",

@@ -107,6 +107,8 @@ physics assets; `create_blueprint`/`set_class_defaults`/`add_variable`/`import_g
 | `import_static_mesh` | import a `.obj`/`.fbx` as a `UStaticMesh` via the automated `UFbxFactory` (no dialog, no Exec); static-mesh-only, no materials by default, combine on; configures collision + lightmap + returns full mesh stats. `.obj`/`.fbx` only — never `.umap`/packages |
 | `configure_static_mesh` | set collision mode, clear simple collision, lightmap UV channel, and assign materials to explicit slots on an imported mesh; optional per-asset save |
 | `place_static_mesh` | spawn a `AStaticMeshActor` for a mesh into the current level at a transform (identity default), with label/folder; undoable, marks level dirty + redraws, **never saves the level** |
+| `recovery_layout` | **read-only**: resolve the canonical map-scoped recovery layout (content paths under `<RecoveryRoot>/<MapSlug>/…` + on-disk Saved paths) for a `map_name` (inferred from the current map, recovery suffixes stripped, when omitted). Sanitizes the slug, rejects traversal/`/Engine`/invalid roots. Not in `IsMutatingCmd` |
+| `inspect_static_mesh_actors` | **read-only** audit of every `StaticMeshActor` in the current level: mesh-or-null, actor + component transform, hidden/visible, mobility, collision, material overrides by slot, plus summary counts. Name/folder filters, offset/limit. Excludes pending-kill; **never dirties the map**. Not in `IsMutatingCmd` |
 
 Limits: 4 clients, 64 MiB per request line, bounded per-tick socket work — a
 wedged or hostile local client gets dropped, never a frozen editor. Regression
@@ -143,13 +145,21 @@ Safety / behavior:
   importer names by filename). Materials/textures/skeletal/animation are off by
   default; `collision:"complex_as_simple"` sets `CTF_UseComplexAsSimple` and
   strips generated simple collision.
+- **Multi-material OBJs:** each `mtllib` sidecar `.mtl` referenced by the OBJ is
+  staged next to the temp copy under its original name, so every `usemtl` group
+  lands in its own material slot. Without the sidecar the FBX SDK sees no
+  materials and collapses the whole mesh to a single slot — so this removes the
+  old need to split a mesh into N single-material OBJs. Slot count comes from the
+  `usemtl` groups, so `import_materials` can stay off; missing sidecars are
+  reported in the result `warnings`. FBX embeds its materials and needs none.
 - Importing a mesh **does not save the current map**. `place_static_mesh` spawns
   an actor and marks the level dirty but likewise never saves it — save the
   level yourself via `save_level` when ready.
 - MCP tools: `bridge_import_static_mesh`, `bridge_configure_static_mesh`,
-  `bridge_place_static_mesh`. The smoke test uses a tiny tracked OBJ fixture
-  (`tests/fixtures/tiny_mesh.obj`); the large Andok acceptance OBJ is exercised
-  manually, not in the automated suite.
+  `bridge_place_static_mesh`. The smoke test uses tiny tracked OBJ fixtures
+  (`tests/fixtures/tiny_mesh.obj`, plus `cube_two_materials.obj` which asserts a
+  two-`usemtl` cube imports as two slots); the large Andok acceptance OBJ is
+  exercised manually, not in the automated suite.
 
 The MCP proxy exposes these as `bridge_*` tools plus one-shot convenience tools:
 **`forge_mapspec`** (MapSpec → preload → import → CSG rebuild, no paste/preloader
@@ -158,6 +168,100 @@ set CDO defaults), and **`forge_bp_graph`** (create BP → add vars → re-home 
 text → import → compile; `rehome_graph_text` repoints owning-class refs into the
 new class). Blueprint graph fixtures are captured from real BPs via `export_graph`,
 never hand-authored — see `Tools/mapgen/capture/fixtures/README.md`.
+
+### Map-scoped recovery layout
+
+Every recovery gets its own map-scoped home so two maps that happen to share
+asset names (`SM_Shell`, `M_Wall`, …) never collide. There are **two roots** with
+a hard separation:
+
+**Editable / regenerated Unreal assets** — under the content recovery root
+(default `/Game/RecoveredMaps`), per map slug:
+
+```
+/Game/RecoveredMaps/<MapSlug>/
+    Maps/  Geometry/BSP/  Geometry/StaticMeshes/  Materials/
+    Textures/  VFX/  Audio/  Blueprints/  Data/
+```
+
+**Non-content recovery files** (raw PAK extraction, interchange, manifests,
+reports) — under the project's `Saved/`, **never inside the Content tree**:
+
+```
+<Project>/Saved/LiandriMapForge/Recoveries/<MapSlug>/
+    RawExtract/  Interchange/  Manifests/  Reports/
+```
+
+Rules the resolver enforces:
+
+- Raw PAK extraction preserves its original `Content/…` hierarchy under
+  `RawExtract/` — extracted `/Game/RestrictedAssets/…` dependencies are **never
+  flattened, relocated, or moved**. Only *regenerated/editable* assets are placed
+  under `/Game/RecoveredMaps/<MapSlug>`; stock `/Game` and `/Engine` assets are
+  left where they are.
+- `MapSlug` is sanitized to `[A-Za-z0-9_-]`. Traversal (`..`), path separators,
+  empty names, `/Engine` roots, and invalid package paths are rejected.
+- Empty content folders aren't force-created; importing the first asset
+  materializes them.
+
+**Resolve it** with `recovery_layout` / `bridge_recovery_layout` (read-only):
+
+```python
+bridge_recovery_layout(map_name="DM-Andok_Scaled")
+# -> content_root=/Game/RecoveredMaps/DM-Andok_Scaled,
+#    static_meshes=/Game/RecoveredMaps/DM-Andok_Scaled/Geometry/StaticMeshes,
+#    filesystem_root=<Project>/Saved/LiandriMapForge/Recoveries/DM-Andok_Scaled, ...
+```
+
+Omit `map_name` to infer it from the current map's short name, stripping one
+recovery suffix (`-Recovered-Editable`, `_Recovered_Editable`, `-Recovered`,
+`_Recovered`) — inference only; an explicit `map_name` is used verbatim.
+
+**Configure the root** (bridge and MCP agree — the bridge is the single
+resolver): default `/Game/RecoveredMaps`, overridable by `[MapForgeBridge]
+RecoveryRoot=` in the editor ini, or the `MAPFORGE_RECOVERY_ROOT` env var in the
+MCP layer (forwarded to the bridge).
+
+**Default mesh destination.** `import_static_mesh` now takes `destination` as
+*optional*. Omit it and pass `map_name` + `category` to land the asset in the
+recovery layout (default category `Geometry/StaticMeshes`); an explicit
+`destination` still works exactly as before.
+
+```python
+# two different recovered maps, same source asset name, no collision:
+bridge_import_static_mesh(source=r"C:\Recovery\SM_Shell.obj",
+                          map_name="DM-Andok_Scaled", category="Geometry/BSP")
+#   -> /Game/RecoveredMaps/DM-Andok_Scaled/Geometry/BSP/SM_Shell
+bridge_import_static_mesh(source=r"C:\Recovery\SM_Shell.obj",
+                          map_name="DM-Deck_Scaled")   # default category
+#   -> /Game/RecoveredMaps/DM-Deck_Scaled/Geometry/StaticMeshes/SM_Shell
+```
+
+Allowed `category` values are the canonical folders only (`Maps`, `Geometry/BSP`,
+`Geometry/StaticMeshes`, `Materials`, `Textures`, `VFX`, `Audio`, `Blueprints`,
+`Data`); anything else — including traversal — is rejected.
+
+**Recovery manifest.** `write_recovery_manifest` (MCP) writes an atomic JSON to
+`…/Recoveries/<MapSlug>/Manifests/recovery_manifest.json` (never inside Content)
+recording the source PAK/map, resolved layout, imported asset paths, source
+filenames + SHA-256 hashes, material substitutions, actor placement counts,
+warnings, a UTC timestamp, and the plugin/engine version.
+
+### Recovery audit workflow
+
+`inspect_static_mesh_actors` / `bridge_inspect_static_mesh_actors` returns a
+read-only snapshot of every `StaticMeshActor` (mesh-or-null, actor + component
+transform, hidden/visible, mobility, collision, material overrides by slot) plus
+summary counts (`total_static_mesh_actors`, `actors_null_mesh`,
+`unique_mesh_paths`, `actors_hidden`, `actors_unresolved_materials`). It excludes
+pending-kill actors, supports name/folder filters + pagination, and **never
+dirties the map**, so it's safe at editor idle.
+
+`audit_static_mesh_actors(actors_manifest_path)` (MCP) compares that live
+snapshot against an `actors_manifest.json` and reports `missing_actors`,
+`extra_actors`, `null_mesh_actors`, `mesh_substitutions`, `transform_mismatches`,
+and `missing_material_overrides` — the precise remaining-gap list for a recovery.
+It mutates nothing.
 
 Build (from the UT4 fork root; **unset `VULKAN_SDK`** — a modern Vulkan SDK
 breaks 4.15's VulkanRHI, and without the env var the engine uses its bundled

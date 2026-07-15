@@ -19,6 +19,7 @@
 #include "AssetRegistryModule.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
@@ -38,9 +39,18 @@
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxStaticMeshImportData.h"
 #include "Factories/FbxMeshImportData.h"
+#include "Factories/SoundFactory.h"
+#include "EditorFramework/AssetImportData.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
 #include "Components/StaticMeshComponent.h"
+#include "Sound/SoundCue.h"
+#include "Sound/SoundNode.h"
+#include "Sound/SoundNodeMixer.h"
+#include "Sound/SoundNodeModulator.h"
+#include "Sound/SoundNodeRandom.h"
+#include "Sound/SoundNodeWavePlayer.h"
+#include "Sound/SoundWave.h"
 #include "PhysicsEngine/BodySetupEnums.h"
 #include "PhysicsEngine/AggregateGeom.h"
 #include "StaticMeshResources.h"
@@ -76,7 +86,9 @@ namespace
 			|| Cmd == TEXT("compile_blueprint")
 			|| Cmd == TEXT("import_static_mesh")
 			|| Cmd == TEXT("configure_static_mesh")
-			|| Cmd == TEXT("place_static_mesh");
+			|| Cmd == TEXT("place_static_mesh")
+			|| Cmd == TEXT("import_sound")
+			|| Cmd == TEXT("create_sound_cue");
 	}
 
 	/** Reject command families that can load/replace the whole map or otherwise
@@ -543,6 +555,11 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::Dispatch(const FString& Cmd, cons
 	if (Cmd == TEXT("import_static_mesh"))                      { return CmdImportStaticMesh(World, Args, OutError); }
 	if (Cmd == TEXT("configure_static_mesh"))                   { return CmdConfigureStaticMesh(World, Args, OutError); }
 	if (Cmd == TEXT("place_static_mesh"))                       { return CmdPlaceStaticMesh(World, Args, OutError); }
+	if (Cmd == TEXT("import_sound"))                            { return CmdImportSound(World, Args, OutError); }
+	if (Cmd == TEXT("create_sound_cue"))                       { return CmdCreateSoundCue(World, Args, OutError); }
+	// Read-only recovery helpers -- deliberately NOT in IsMutatingCmd.
+	if (Cmd == TEXT("recovery_layout"))                         { return CmdRecoveryLayout(World, Args, OutError); }
+	if (Cmd == TEXT("inspect_static_mesh_actors"))              { return CmdInspectStaticMeshActors(World, Args, OutError); }
 
 	OutError = FString::Printf(TEXT("unknown cmd '%s'"), *Cmd);
 	return nullptr;
@@ -2019,6 +2036,212 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdExportGraph(UWorld* World, con
 	return Result;
 }
 
+namespace
+{
+	// ---- Map-scoped recovery layout ------------------------------------------
+	// Editable/regenerated recovery assets live under <RecoveryRoot>/<MapSlug>/...
+	// in Unreal content; raw PAK extraction and other non-content recovery files
+	// live under Saved/LiandriMapForge/Recoveries/<MapSlug>/. Stock /Game,
+	// /Engine and extracted /Game/RestrictedAssets dependencies are never moved
+	// here -- only regenerated assets are placed under the recovery root.
+
+	const TCHAR* const DefaultRecoveryRoot = TEXT("/Game/RecoveredMaps");
+
+	/** Keep only [A-Za-z0-9_-]; every other char becomes '_' (the MapSlug rule). */
+	FString SanitizeMapSlug(const FString& In)
+	{
+		FString Out;
+		for (int32 i = 0; i < In.Len(); ++i)
+		{
+			const TCHAR C = In[i];
+			const bool bOk = (C >= '0' && C <= '9') || (C >= 'A' && C <= 'Z')
+				|| (C >= 'a' && C <= 'z') || C == TEXT('_') || C == TEXT('-');
+			Out.AppendChar(bOk ? C : TEXT('_'));
+		}
+		return Out;
+	}
+
+	/** Strip one recovery suffix (longest first). Applied ONLY to an inferred
+	    map name, never to a caller-supplied map_name. */
+	FString StripRecoverySuffix(const FString& In)
+	{
+		static const TCHAR* const Suffixes[] = {
+			TEXT("-Recovered-Editable"), TEXT("_Recovered_Editable"),
+			TEXT("-Recovered"), TEXT("_Recovered")
+		};
+		for (const TCHAR* Suffix : Suffixes)
+		{
+			if (In.EndsWith(Suffix, ESearchCase::IgnoreCase))
+			{
+				return In.LeftChop(FCString::Strlen(Suffix));
+			}
+		}
+		return In;
+	}
+
+	/** Resolve the map slug: caller 'map_name', else the current map's short
+	    package name with recovery suffixes stripped. Rejects path/traversal
+	    input and names that sanitize to empty. */
+	bool ResolveMapSlug(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutSlug, FString& OutErr)
+	{
+		FString MapName;
+		const bool bProvided = Args->TryGetStringField(TEXT("map_name"), MapName) && !MapName.IsEmpty();
+		if (!bProvided)
+		{
+			const FString Pkg = World->GetCurrentLevel()->GetOutermost()->GetName();
+			MapName = StripRecoverySuffix(FPackageName::GetShortName(Pkg));
+		}
+		if (MapName.Contains(TEXT("..")) || MapName.Contains(TEXT("/")) || MapName.Contains(TEXT("\\")))
+		{
+			OutErr = FString::Printf(TEXT("invalid map_name '%s' (must be a bare name -- no path separators or traversal)"), *MapName);
+			return false;
+		}
+		const FString Slug = SanitizeMapSlug(MapName);
+		if (Slug.IsEmpty())
+		{
+			OutErr = TEXT("map_name is empty after sanitization");
+			return false;
+		}
+		OutSlug = Slug;
+		return true;
+	}
+
+	/** Resolve the recovery root: 'recovery_root' arg, else [MapForgeBridge]
+	    RecoveryRoot= in the editor ini, else the default. Must be a /Game
+	    content path (never /Engine), with no traversal. */
+	bool ResolveRecoveryRoot(const TSharedRef<FJsonObject>& Args, FString& OutRoot, FString& OutErr)
+	{
+		FString Root;
+		if (!(Args->TryGetStringField(TEXT("recovery_root"), Root) && !Root.IsEmpty()))
+		{
+			Root.Empty();
+			if (!(GConfig != nullptr && GConfig->GetString(TEXT("MapForgeBridge"), TEXT("RecoveryRoot"), Root, GEditorPerProjectIni) && !Root.IsEmpty()))
+			{
+				Root = DefaultRecoveryRoot;
+			}
+		}
+		Root = Root.Replace(TEXT("\\"), TEXT("/"));
+		while (Root.EndsWith(TEXT("/"))) { Root = Root.LeftChop(1); }
+		if (Root.Contains(TEXT("..")))
+		{
+			OutErr = TEXT("recovery_root must not contain traversal ('..')");
+			return false;
+		}
+		if (!Root.StartsWith(TEXT("/Game/")))
+		{
+			OutErr = FString::Printf(TEXT("recovery_root must be under /Game/ (got '%s')"), *Root);
+			return false;
+		}
+		OutRoot = Root;
+		return true;
+	}
+
+	/** Accept only a canonical content category; return its canonical subfolder.
+	    Empty -> the default Geometry/StaticMeshes. Rejects traversal and any
+	    name outside the known set. */
+	bool ResolveRecoveryCategory(const FString& Category, FString& OutSub, FString& OutErr)
+	{
+		static const TCHAR* const Known[] = {
+			TEXT("Maps"), TEXT("Geometry/BSP"), TEXT("Geometry/StaticMeshes"),
+			TEXT("Materials"), TEXT("Textures"), TEXT("VFX"), TEXT("Audio"),
+			TEXT("Blueprints"), TEXT("Data")
+		};
+		if (Category.IsEmpty())
+		{
+			OutSub = TEXT("Geometry/StaticMeshes");
+			return true;
+		}
+		FString C = Category.Replace(TEXT("\\"), TEXT("/"));
+		while (C.StartsWith(TEXT("/"))) { C = C.RightChop(1); }
+		while (C.EndsWith(TEXT("/"))) { C = C.LeftChop(1); }
+		if (C.Contains(TEXT("..")))
+		{
+			OutErr = TEXT("category must not contain traversal ('..')");
+			return false;
+		}
+		for (const TCHAR* K : Known)
+		{
+			if (C.Equals(K, ESearchCase::IgnoreCase)) { OutSub = K; return true; }
+		}
+		OutErr = FString::Printf(TEXT("unknown category '%s' (allowed: Maps, Geometry/BSP, Geometry/StaticMeshes, Materials, Textures, VFX, Audio, Blueprints, Data)"), *Category);
+		return false;
+	}
+
+	/** Build the full recovery-layout result: content package paths under
+	    <root>/<slug>, plus the on-disk Saved paths for non-content files. */
+	TSharedRef<FJsonObject> MakeRecoveryLayout(const FString& Slug, const FString& Root)
+	{
+		const FString ContentRoot = Root + TEXT("/") + Slug;
+		const FString FsRoot = FPaths::ConvertRelativePathToFull(
+			FPaths::GameSavedDir() / TEXT("LiandriMapForge") / TEXT("Recoveries") / Slug);
+
+		TSharedRef<FJsonObject> R = MakeShareable(new FJsonObject());
+		R->SetStringField(TEXT("map_slug"), Slug);
+		R->SetStringField(TEXT("content_root"), ContentRoot);
+		R->SetStringField(TEXT("maps"),          ContentRoot + TEXT("/Maps"));
+		R->SetStringField(TEXT("bsp"),           ContentRoot + TEXT("/Geometry/BSP"));
+		R->SetStringField(TEXT("static_meshes"), ContentRoot + TEXT("/Geometry/StaticMeshes"));
+		R->SetStringField(TEXT("materials"),     ContentRoot + TEXT("/Materials"));
+		R->SetStringField(TEXT("textures"),      ContentRoot + TEXT("/Textures"));
+		R->SetStringField(TEXT("vfx"),           ContentRoot + TEXT("/VFX"));
+		R->SetStringField(TEXT("audio"),         ContentRoot + TEXT("/Audio"));
+		R->SetStringField(TEXT("blueprints"),    ContentRoot + TEXT("/Blueprints"));
+		R->SetStringField(TEXT("data"),          ContentRoot + TEXT("/Data"));
+		R->SetStringField(TEXT("filesystem_root"), FsRoot);
+		R->SetStringField(TEXT("raw_extract"), FsRoot / TEXT("RawExtract"));
+		R->SetStringField(TEXT("interchange"), FsRoot / TEXT("Interchange"));
+		R->SetStringField(TEXT("manifests"),   FsRoot / TEXT("Manifests"));
+		R->SetStringField(TEXT("reports"),     FsRoot / TEXT("Reports"));
+		return R;
+	}
+
+	const TCHAR* MobilityToString(EComponentMobility::Type M)
+	{
+		switch (M)
+		{
+			case EComponentMobility::Static:     return TEXT("Static");
+			case EComponentMobility::Stationary: return TEXT("Stationary");
+			case EComponentMobility::Movable:    return TEXT("Movable");
+			default:                             return TEXT("Unknown");
+		}
+	}
+
+	const TCHAR* CollisionEnabledToString(ECollisionEnabled::Type C)
+	{
+		switch (C)
+		{
+			case ECollisionEnabled::NoCollision:     return TEXT("NoCollision");
+			case ECollisionEnabled::QueryOnly:       return TEXT("QueryOnly");
+			case ECollisionEnabled::PhysicsOnly:     return TEXT("PhysicsOnly");
+			case ECollisionEnabled::QueryAndPhysics: return TEXT("QueryAndPhysics");
+			default:                                 return TEXT("Unknown");
+		}
+	}
+
+	TSharedRef<FJsonObject> MakeVec3Json(const FVector& V)
+	{
+		TSharedRef<FJsonObject> O = MakeShareable(new FJsonObject());
+		O->SetNumberField(TEXT("x"), V.X);
+		O->SetNumberField(TEXT("y"), V.Y);
+		O->SetNumberField(TEXT("z"), V.Z);
+		return O;
+	}
+
+	TSharedRef<FJsonObject> MakeTransformJson(const FTransform& T)
+	{
+		const FRotator Rot = T.Rotator();
+		TSharedRef<FJsonObject> RotObj = MakeShareable(new FJsonObject());
+		RotObj->SetNumberField(TEXT("pitch"), Rot.Pitch);
+		RotObj->SetNumberField(TEXT("yaw"), Rot.Yaw);
+		RotObj->SetNumberField(TEXT("roll"), Rot.Roll);
+		TSharedRef<FJsonObject> O = MakeShareable(new FJsonObject());
+		O->SetObjectField(TEXT("location"), MakeVec3Json(T.GetLocation()));
+		O->SetObjectField(TEXT("rotation"), RotObj);
+		O->SetObjectField(TEXT("scale"), MakeVec3Json(T.GetScale3D()));
+		return O;
+	}
+}
+
 TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
 {
 	FString Source, Destination, NameArg;
@@ -2027,11 +2250,9 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 		OutError = TEXT("missing 'source'");
 		return nullptr;
 	}
-	if (!Args->TryGetStringField(TEXT("destination"), Destination) || Destination.IsEmpty())
-	{
-		OutError = TEXT("missing 'destination'");
-		return nullptr;
-	}
+	// 'destination' is optional: when omitted it resolves through the canonical
+	// recovery layout below. An explicit destination is used verbatim.
+	Args->TryGetStringField(TEXT("destination"), Destination);
 	Args->TryGetStringField(TEXT("name"), NameArg);
 	bool bOverwrite = false;
 	Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
@@ -2054,6 +2275,22 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 	{
 		return nullptr;
 	}
+
+	// Resolve a default map-scoped destination when none is supplied. Existing
+	// callers that pass an explicit 'destination' are unaffected (used verbatim).
+	// Empty -> <RecoveryRoot>/<MapSlug>/<category>, default Geometry/StaticMeshes.
+	TSharedPtr<FJsonObject> ResolvedLayout;
+	if (Destination.IsEmpty())
+	{
+		FString Slug, Root, CategorySub, Category;
+		Args->TryGetStringField(TEXT("category"), Category);
+		if (!ResolveMapSlug(World, Args, Slug, OutError)) { return nullptr; }
+		if (!ResolveRecoveryRoot(Args, Root, OutError)) { return nullptr; }
+		if (!ResolveRecoveryCategory(Category, CategorySub, OutError)) { return nullptr; }
+		Destination = Root + TEXT("/") + Slug + TEXT("/") + CategorySub;
+		ResolvedLayout = MakeRecoveryLayout(Slug, Root);
+	}
+
 	if (!ValidContentDestination(Destination, OutError))
 	{
 		return nullptr;
@@ -2107,7 +2344,10 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 	const bool bAutoSimpleCollision = (ModeLower == TEXT("simple"));
 
 	// --- stage a temp copy named <AssetName>.<ext>, so the automated import
-	// (which names the asset after the source file) yields our exact name ---
+	// (which names the asset after the source file) yields our exact name.
+	// Track every staged file so the cleanup below removes all of them. ---
+	TArray<FString> Warnings;
+	TArray<FString> StagedFiles;
 	const FString TempDir = FPaths::Combine(*FPaths::GameIntermediateDir(), TEXT("MapForgeImport"));
 	IFileManager::Get().MakeDirectory(*TempDir, true);
 	const FString TempFile = FPaths::Combine(*TempDir, *(AssetName + TEXT(".") + Ext));
@@ -2115,6 +2355,66 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 	{
 		OutError = FString::Printf(TEXT("failed to stage source to '%s'"), *TempFile);
 		return nullptr;
+	}
+	StagedFiles.Add(TempFile);
+
+	// OBJ material slots come from the FBX SDK reading the .mtl sidecar named
+	// in each `mtllib` directive: with no MTL alongside the OBJ the SDK reports
+	// zero materials and the mesh collapses to one slot (FbxStaticMeshImport.cpp
+	// forces a single default slot when MaterialCount==0). Copy each referenced
+	// MTL next to the temp OBJ under its original name so the temp OBJ's
+	// unchanged `mtllib` line resolves. FBX embeds its materials -- OBJ only.
+	if (Ext == TEXT("obj"))
+	{
+		FString ObjText;
+		if (FFileHelper::LoadFileToString(ObjText, *Source))
+		{
+			const FString SourceDir = FPaths::GetPath(Source);
+			TArray<FString> Lines;
+			ObjText.ParseIntoArrayLines(Lines);
+			for (const FString& Line : Lines)
+			{
+				TArray<FString> Tokens;
+				Line.ParseIntoArrayWS(Tokens);
+				if (Tokens.Num() < 2 || !Tokens[0].Equals(TEXT("mtllib"), ESearchCase::IgnoreCase))
+				{
+					continue;
+				}
+				// A single `mtllib` line may list several .mtl files.
+				for (int32 i = 1; i < Tokens.Num(); ++i)
+				{
+					const FString& MtlName = Tokens[i];
+					// Keep staging strictly inside TempDir: never follow an
+					// absolute path or a `..` out of it, since cleanup deletes
+					// whatever we stage.
+					if (!FPaths::IsRelative(MtlName) || MtlName.Contains(TEXT("..")))
+					{
+						Warnings.Add(FString::Printf(TEXT("ignored unsafe mtllib path '%s'"), *MtlName));
+						continue;
+					}
+					const FString SrcMtl = FPaths::Combine(*SourceDir, *MtlName);
+					const FString DstMtl = FPaths::Combine(*TempDir, *MtlName);
+					if (!IFileManager::Get().FileExists(*SrcMtl))
+					{
+						Warnings.Add(FString::Printf(TEXT("mtllib '%s' not found next to source; material slots may collapse"), *MtlName));
+						continue;
+					}
+					IFileManager::Get().MakeDirectory(*FPaths::GetPath(DstMtl), true);
+					if (IFileManager::Get().Copy(*DstMtl, *SrcMtl, true, true) == COPY_OK)
+					{
+						StagedFiles.Add(DstMtl);
+					}
+					else
+					{
+						Warnings.Add(FString::Printf(TEXT("failed to stage mtllib '%s'"), *MtlName));
+					}
+				}
+			}
+		}
+		else
+		{
+			Warnings.Add(TEXT("could not read source OBJ to stage its .mtl sidecar(s)"));
+		}
 	}
 
 	// --- configure a static-mesh-only, no-dialog FBX/OBJ factory ---
@@ -2154,7 +2454,10 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 
 	Factory->RemoveFromRoot();
 	Data->RemoveFromRoot();
-	IFileManager::Get().Delete(*TempFile, false, true, true);
+	for (const FString& Staged : StagedFiles)
+	{
+		IFileManager::Get().Delete(*Staged, false, true, true);
+	}
 
 	UStaticMesh* Mesh = nullptr;
 	for (UObject* Obj : ImportedObjects)
@@ -2171,8 +2474,7 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 		return nullptr;
 	}
 
-	// --- post-import configuration ---
-	TArray<FString> Warnings;
+	// --- post-import configuration (Warnings was declared during staging) ---
 	ApplyCollision(Mesh, CollisionMode, /*bClearSimple*/ ModeLower == TEXT("complex_as_simple"), Warnings);
 	// The import already builds with DstLightmapIndex=1; only rebuild if a
 	// different lightmap channel was requested.
@@ -2193,9 +2495,16 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 	Result->SetStringField(TEXT("package"), Mesh->GetOutermost()->GetName());
 	Result->SetStringField(TEXT("class"), Mesh->GetClass()->GetName());
 	Result->SetStringField(TEXT("source"), Source);
+	Result->SetStringField(TEXT("destination"), DestFolder);
 	Result->SetBoolField(TEXT("created"), !bExists);
 	Result->SetBoolField(TEXT("overwritten"), bExists);
 	Result->SetBoolField(TEXT("saved"), bSaved);
+	// When the destination was auto-resolved, echo the full recovery layout so
+	// callers can record/verify where the asset landed.
+	if (ResolvedLayout.IsValid())
+	{
+		Result->SetObjectField(TEXT("recovery_layout"), ResolvedLayout.ToSharedRef());
+	}
 	FillMeshStats(Mesh, Result);
 	TArray<TSharedPtr<FJsonValue>> WarnArr;
 	for (const FString& W : Warnings)
@@ -2203,6 +2512,402 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World
 		WarnArr.Add(MakeShareable(new FJsonValueString(W)));
 	}
 	Result->SetArrayField(TEXT("warnings"), WarnArr);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportSound(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString Source, Destination, NameArg;
+	if (!Args->TryGetStringField(TEXT("source"), Source) || Source.IsEmpty())
+	{
+		OutError = TEXT("missing 'source'");
+		return nullptr;
+	}
+	if (!Args->TryGetStringField(TEXT("destination"), Destination) || Destination.IsEmpty())
+	{
+		OutError = TEXT("missing 'destination'");
+		return nullptr;
+	}
+	Args->TryGetStringField(TEXT("name"), NameArg);
+	bool bOverwrite = false;
+	Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+	bool bLooping = false;
+	Args->TryGetBoolField(TEXT("looping"), bLooping);
+
+	if (FPaths::IsRelative(Source))
+	{
+		OutError = TEXT("'source' must be an absolute path");
+		return nullptr;
+	}
+	if (!IFileManager::Get().FileExists(*Source))
+	{
+		OutError = FString::Printf(TEXT("source file not found: '%s'"), *Source);
+		return nullptr;
+	}
+	if (!FPaths::GetExtension(Source).Equals(TEXT("wav"), ESearchCase::IgnoreCase))
+	{
+		OutError = TEXT("unsupported sound extension (only 16-bit mono/stereo .wav is allowed)");
+		return nullptr;
+	}
+	if (!ValidContentDestination(Destination, OutError))
+	{
+		return nullptr;
+	}
+
+	FString AssetName = SanitizeMeshAssetName(NameArg.IsEmpty() ? FPaths::GetBaseFilename(Source) : NameArg);
+	if (AssetName.IsEmpty())
+	{
+		OutError = TEXT("asset name is empty after sanitization");
+		return nullptr;
+	}
+	FString DestFolder = Destination;
+	while (DestFolder.EndsWith(TEXT("/")))
+	{
+		DestFolder = DestFolder.LeftChop(1);
+	}
+	const FString PackagePath = DestFolder + TEXT("/") + AssetName;
+	const FString ObjectPath = PackagePath + TEXT(".") + AssetName;
+	if (!FPackageName::IsValidLongPackageName(PackagePath))
+	{
+		OutError = FString::Printf(TEXT("invalid target package '%s'"), *PackagePath);
+		return nullptr;
+	}
+
+	const bool bExists = (LoadObject<UObject>(nullptr, *ObjectPath) != nullptr)
+		|| FPackageName::DoesPackageExist(PackagePath);
+	if (bExists && !bOverwrite)
+	{
+		OutError = FString::Printf(TEXT("asset '%s' already exists (pass overwrite=true)"), *PackagePath);
+		return nullptr;
+	}
+
+	// Stage under the requested asset name because automated imports derive the
+	// object name from the source filename. USoundFactory is configured to avoid
+	// cue creation and every overwrite prompt; cues are built by the dedicated
+	// create_sound_cue verb instead.
+	const FString TempDir = FPaths::Combine(*FPaths::GameIntermediateDir(), TEXT("MapForgeImport"), TEXT("Audio"));
+	IFileManager::Get().MakeDirectory(*TempDir, true);
+	const FString TempFile = FPaths::Combine(*TempDir, *(AssetName + TEXT(".wav")));
+	if (IFileManager::Get().Copy(*TempFile, *Source, true, true) != COPY_OK)
+	{
+		OutError = FString::Printf(TEXT("failed to stage source to '%s'"), *TempFile);
+		return nullptr;
+	}
+
+	USoundFactory* Factory = NewObject<USoundFactory>();
+	Factory->AddToRoot();
+	Factory->bAutoCreateCue = false;
+	if (bOverwrite)
+	{
+		USoundFactory::SuppressImportOverwriteDialog();
+	}
+
+	UAutomatedAssetImportData* Data = NewObject<UAutomatedAssetImportData>();
+	Data->AddToRoot();
+	Data->Filenames.Add(TempFile);
+	Data->DestinationPath = DestFolder;
+	Data->Factory = Factory;
+	Data->bReplaceExisting = bOverwrite;
+
+	const FScopedTransaction Transaction(FText::FromString(TEXT("MapForge Import Sound")));
+	FAssetToolsModule& AssetToolsModule = FModuleManager::Get().LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+	TArray<UObject*> ImportedObjects = AssetToolsModule.Get().ImportAssetsAutomated(*Data);
+
+	Factory->RemoveFromRoot();
+	Data->RemoveFromRoot();
+	IFileManager::Get().Delete(*TempFile, false, true, true);
+
+	USoundWave* Wave = nullptr;
+	for (UObject* Obj : ImportedObjects)
+	{
+		Wave = Cast<USoundWave>(Obj);
+		if (Wave != nullptr)
+		{
+			break;
+		}
+	}
+	if (Wave == nullptr && bOverwrite)
+	{
+		Wave = LoadObject<USoundWave>(nullptr, *ObjectPath);
+	}
+	if (Wave == nullptr)
+	{
+		OutError = TEXT("import produced no SoundWave (the WAV may not be 16-bit mono/stereo PCM)");
+		return nullptr;
+	}
+
+	Wave->Modify();
+	Wave->bLooping = bLooping;
+	if (Wave->AssetImportData != nullptr)
+	{
+		Wave->AssetImportData->Update(Source);
+	}
+	Wave->PostEditChange();
+	Wave->MarkPackageDirty();
+	const bool bSaved = bSave ? SaveAssetPackage(Wave) : false;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Wave->GetPathName());
+	Result->SetStringField(TEXT("package"), Wave->GetOutermost()->GetName());
+	Result->SetStringField(TEXT("class"), Wave->GetClass()->GetName());
+	Result->SetStringField(TEXT("source"), Source);
+	Result->SetStringField(TEXT("destination"), DestFolder);
+	Result->SetBoolField(TEXT("created"), !bExists);
+	Result->SetBoolField(TEXT("overwritten"), bExists);
+	Result->SetBoolField(TEXT("looping"), Wave->bLooping != 0);
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	Result->SetNumberField(TEXT("duration"), Wave->Duration);
+	Result->SetNumberField(TEXT("sample_rate"), Wave->SampleRate);
+	Result->SetNumberField(TEXT("channels"), Wave->NumChannels);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdCreateSoundCue(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString Destination, NameArg, Mode;
+	if (!Args->TryGetStringField(TEXT("destination"), Destination) || Destination.IsEmpty())
+	{
+		OutError = TEXT("missing 'destination'");
+		return nullptr;
+	}
+	if (!Args->TryGetStringField(TEXT("name"), NameArg) || NameArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'name'");
+		return nullptr;
+	}
+	Args->TryGetStringField(TEXT("mode"), Mode);
+	Mode = Mode.IsEmpty() ? TEXT("single") : Mode.ToLower();
+	if (Mode != TEXT("single") && Mode != TEXT("random") && Mode != TEXT("mixer"))
+	{
+		OutError = FString::Printf(TEXT("unsupported cue mode '%s' (use single, random, or mixer)"), *Mode);
+		return nullptr;
+	}
+	if (!ValidContentDestination(Destination, OutError))
+	{
+		return nullptr;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* WaveValues = nullptr;
+	if (!Args->TryGetArrayField(TEXT("waves"), WaveValues) || WaveValues == nullptr || WaveValues->Num() == 0)
+	{
+		OutError = TEXT("'waves' must contain at least one SoundWave asset path");
+		return nullptr;
+	}
+	if (Mode == TEXT("single") && WaveValues->Num() != 1)
+	{
+		OutError = TEXT("single cue mode requires exactly one wave");
+		return nullptr;
+	}
+	// USoundNode::MAX_ALLOWED_CHILD_NODES is private in this 4.15 fork.
+	// Random and Mixer nodes both expose the same hard limit of 32 inputs.
+	const int32 MaxCueInputs = 32;
+	if (WaveValues->Num() > MaxCueInputs)
+	{
+		OutError = FString::Printf(TEXT("cue has %d waves; maximum is %d"), WaveValues->Num(), MaxCueInputs);
+		return nullptr;
+	}
+
+	TArray<USoundWave*> Waves;
+	TArray<TSharedPtr<FJsonValue>> ResolvedWavePaths;
+	for (const TSharedPtr<FJsonValue>& Value : *WaveValues)
+	{
+		FString WavePath = Value->AsString();
+		if (!WavePath.Contains(TEXT(".")))
+		{
+			WavePath += TEXT(".") + FPackageName::GetShortName(WavePath);
+		}
+		USoundWave* Wave = LoadObject<USoundWave>(nullptr, *WavePath);
+		if (Wave == nullptr)
+		{
+			OutError = FString::Printf(TEXT("could not load SoundWave '%s'"), *WavePath);
+			return nullptr;
+		}
+		Waves.Add(Wave);
+		ResolvedWavePaths.Add(MakeShareable(new FJsonValueString(Wave->GetPathName())));
+	}
+
+	bool bOverwrite = false;
+	Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+	bool bLooping = false;
+	Args->TryGetBoolField(TEXT("looping"), bLooping);
+	bool bWithoutReplacement = true;
+	Args->TryGetBoolField(TEXT("random_without_replacement"), bWithoutReplacement);
+	double CueVolume = 0.75;
+	Args->TryGetNumberField(TEXT("volume"), CueVolume);
+	double CuePitch = 1.0;
+	Args->TryGetNumberField(TEXT("pitch"), CuePitch);
+	const TArray<TSharedPtr<FJsonValue>>* MixerVolumeValues = nullptr;
+	if (Mode == TEXT("mixer")
+		&& Args->TryGetArrayField(TEXT("mixer_volumes"), MixerVolumeValues)
+		&& MixerVolumeValues != nullptr
+		&& MixerVolumeValues->Num() != Waves.Num())
+	{
+		OutError = TEXT("mixer_volumes must contain one value per wave");
+		return nullptr;
+	}
+
+	FString AssetName = SanitizeMeshAssetName(NameArg);
+	if (AssetName.IsEmpty())
+	{
+		OutError = TEXT("cue name is empty after sanitization");
+		return nullptr;
+	}
+	FString DestFolder = Destination;
+	while (DestFolder.EndsWith(TEXT("/")))
+	{
+		DestFolder = DestFolder.LeftChop(1);
+	}
+	const FString PackagePath = DestFolder + TEXT("/") + AssetName;
+	const FString ObjectPath = PackagePath + TEXT(".") + AssetName;
+	if (!FPackageName::IsValidLongPackageName(PackagePath))
+	{
+		OutError = FString::Printf(TEXT("invalid target package '%s'"), *PackagePath);
+		return nullptr;
+	}
+
+	UObject* ExistingObject = LoadObject<UObject>(nullptr, *ObjectPath);
+	const bool bExists = ExistingObject != nullptr || FPackageName::DoesPackageExist(PackagePath);
+	if (bExists && !bOverwrite)
+	{
+		OutError = FString::Printf(TEXT("asset '%s' already exists (pass overwrite=true)"), *PackagePath);
+		return nullptr;
+	}
+	USoundCue* Cue = Cast<USoundCue>(ExistingObject);
+	if (ExistingObject != nullptr && Cue == nullptr)
+	{
+		OutError = FString::Printf(TEXT("target '%s' exists but is not a SoundCue"), *ObjectPath);
+		return nullptr;
+	}
+
+	const FScopedTransaction Transaction(FText::FromString(TEXT("MapForge Create Sound Cue")));
+	UPackage* Package = CreatePackage(nullptr, *PackagePath);
+	if (Package == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not create package '%s'"), *PackagePath);
+		return nullptr;
+	}
+	if (Cue == nullptr)
+	{
+		Cue = NewObject<USoundCue>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+		FAssetRegistryModule::AssetCreated(Cue);
+	}
+	else
+	{
+		Cue->Modify();
+		Cue->ClearGraph();
+		Cue->AllNodes.Empty();
+		Cue->FirstNode = nullptr;
+	}
+
+	Cue->VolumeMultiplier = FMath::Max(0.0f, (float)CueVolume);
+	Cue->PitchMultiplier = FMath::Clamp((float)CuePitch, 0.4f, 2.0f);
+
+	USoundNode* ContentNode = nullptr;
+	USoundNodeRandom* RandomNode = nullptr;
+	USoundNodeMixer* MixerNode = nullptr;
+	if (Mode == TEXT("random"))
+	{
+		RandomNode = Cue->ConstructSoundNode<USoundNodeRandom>();
+		RandomNode->bRandomizeWithoutReplacement = bWithoutReplacement;
+		RandomNode->CreateStartingConnectors();
+		ContentNode = RandomNode;
+	}
+	else if (Mode == TEXT("mixer"))
+	{
+		MixerNode = Cue->ConstructSoundNode<USoundNodeMixer>();
+		MixerNode->CreateStartingConnectors();
+		ContentNode = MixerNode;
+	}
+
+	if (ContentNode != nullptr)
+	{
+		while (ContentNode->ChildNodes.Num() < Waves.Num())
+		{
+			ContentNode->InsertChildNode(ContentNode->ChildNodes.Num());
+		}
+		while (ContentNode->ChildNodes.Num() > Waves.Num())
+		{
+			ContentNode->RemoveChildNode(ContentNode->ChildNodes.Num() - 1);
+		}
+		ContentNode->PlaceNode(1, 0, 1);
+	}
+
+	TArray<USoundNodeWavePlayer*> Players;
+	for (int32 Index = 0; Index < Waves.Num(); ++Index)
+	{
+		USoundNodeWavePlayer* Player = Cue->ConstructSoundNode<USoundNodeWavePlayer>();
+		Player->SetSoundWave(Waves[Index]);
+		Player->bLooping = bLooping;
+		Player->PlaceNode(ContentNode != nullptr ? 2 : 1, Index, Waves.Num());
+		Players.Add(Player);
+		if (ContentNode != nullptr)
+		{
+			ContentNode->ChildNodes[Index] = Player;
+		}
+	}
+	if (ContentNode == nullptr)
+	{
+		ContentNode = Players[0];
+	}
+
+	if (MixerNode != nullptr)
+	{
+		if (MixerVolumeValues != nullptr)
+		{
+			for (int32 Index = 0; Index < MixerVolumeValues->Num(); ++Index)
+			{
+				MixerNode->InputVolume[Index] = FMath::Max(0.0f, (float)(*MixerVolumeValues)[Index]->AsNumber());
+			}
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* ModulatorPtr = nullptr;
+	if (Args->TryGetObjectField(TEXT("modulator"), ModulatorPtr) && ModulatorPtr != nullptr && ModulatorPtr->IsValid())
+	{
+		TSharedPtr<FJsonObject> ModulatorArgs = *ModulatorPtr;
+		auto ModNumber = [&ModulatorArgs](const TCHAR* Key, float DefaultValue)
+		{
+			double Value = DefaultValue;
+			ModulatorArgs->TryGetNumberField(Key, Value);
+			return (float)Value;
+		};
+		USoundNodeModulator* Modulator = Cue->ConstructSoundNode<USoundNodeModulator>();
+		Modulator->PitchMin = FMath::Clamp(ModNumber(TEXT("pitch_min"), 0.95f), 0.4f, 2.0f);
+		Modulator->PitchMax = FMath::Clamp(ModNumber(TEXT("pitch_max"), 1.05f), Modulator->PitchMin, 2.0f);
+		Modulator->VolumeMin = FMath::Max(0.0f, ModNumber(TEXT("volume_min"), 0.9f));
+		Modulator->VolumeMax = FMath::Max(Modulator->VolumeMin, ModNumber(TEXT("volume_max"), 1.0f));
+		Modulator->CreateStartingConnectors();
+		Modulator->ChildNodes[0] = ContentNode;
+		Modulator->PlaceNode(0, 0, 1);
+		Cue->FirstNode = Modulator;
+	}
+	else
+	{
+		Cue->FirstNode = ContentNode;
+	}
+
+	Cue->LinkGraphNodesFromSoundNodes();
+	Cue->PostEditChange();
+	Cue->MarkPackageDirty();
+	const bool bSaved = bSave ? SaveAssetPackage(Cue) : false;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Cue->GetPathName());
+	Result->SetStringField(TEXT("package"), Cue->GetOutermost()->GetName());
+	Result->SetStringField(TEXT("class"), Cue->GetClass()->GetName());
+	Result->SetStringField(TEXT("destination"), DestFolder);
+	Result->SetStringField(TEXT("mode"), Mode);
+	Result->SetArrayField(TEXT("waves"), ResolvedWavePaths);
+	Result->SetNumberField(TEXT("wave_count"), Waves.Num());
+	Result->SetNumberField(TEXT("node_count"), Cue->AllNodes.Num());
+	Result->SetBoolField(TEXT("looping"), bLooping);
+	Result->SetBoolField(TEXT("created"), !bExists);
+	Result->SetBoolField(TEXT("overwritten"), bExists);
+	Result->SetBoolField(TEXT("saved"), bSaved);
 	return Result;
 }
 
@@ -2385,5 +3090,130 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdPlaceStaticMesh(UWorld* World,
 	Result->SetStringField(TEXT("path"), Actor->GetPathName());
 	Result->SetStringField(TEXT("mesh"), Mesh->GetPathName());
 	Result->SetObjectField(TEXT("transform"), TransformObj);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdRecoveryLayout(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString Slug, Root;
+	if (!ResolveMapSlug(World, Args, Slug, OutError)) { return nullptr; }
+	if (!ResolveRecoveryRoot(Args, Root, OutError)) { return nullptr; }
+	const FString ContentRoot = Root + TEXT("/") + Slug;
+	if (!FPackageName::IsValidLongPackageName(ContentRoot))
+	{
+		OutError = FString::Printf(TEXT("resolved content root is not a valid package path: '%s'"), *ContentRoot);
+		return nullptr;
+	}
+	return MakeRecoveryLayout(Slug, Root);
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdInspectStaticMeshActors(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	ULevel* Level = World->GetCurrentLevel();
+
+	FString NameFilter, FolderFilter;
+	Args->TryGetStringField(TEXT("name_contains"), NameFilter);
+	Args->TryGetStringField(TEXT("folder_contains"), FolderFilter);
+	int32 Offset = 0;
+	int32 Limit = 1000;
+	double NumTmp = 0.0;
+	if (Args->TryGetNumberField(TEXT("offset"), NumTmp)) { Offset = FMath::Max(0, (int32)NumTmp); }
+	if (Args->TryGetNumberField(TEXT("limit"), NumTmp)) { Limit = FMath::Max(0, (int32)NumTmp); }
+
+	// Summaries span every matching actor, independent of the pagination window.
+	int32 Total = 0, NullMeshCount = 0, HiddenCount = 0, UnresolvedCount = 0;
+	TSet<FString> UniqueMeshes;
+
+	TArray<TSharedPtr<FJsonValue>> Items;
+	int32 MatchIndex = 0;
+
+	// Read-only pass: no Modify()/spawn/property edits, so the level never dirties.
+	for (AActor* Actor : Level->Actors)
+	{
+		AStaticMeshActor* SMA = Cast<AStaticMeshActor>(Actor);
+		if (SMA == nullptr || SMA->IsPendingKill())
+		{
+			continue;
+		}
+		const FString ActorName = SMA->GetName();
+		const FString ActorLabel = SMA->GetActorLabel();
+		const FString FolderPath = SMA->GetFolderPath().ToString();
+		if (!NameFilter.IsEmpty() && !ActorName.Contains(NameFilter) && !ActorLabel.Contains(NameFilter))
+		{
+			continue;
+		}
+		if (!FolderFilter.IsEmpty() && !FolderPath.Contains(FolderFilter))
+		{
+			continue;
+		}
+
+		UStaticMeshComponent* SMC = SMA->GetStaticMeshComponent();
+		UStaticMesh* Mesh = (SMC != nullptr) ? SMC->GetStaticMesh() : nullptr;
+		const bool bHidden = SMA->bHidden || SMA->IsHiddenEd();
+		const int32 NumMats = (SMC != nullptr) ? SMC->GetNumMaterials() : 0;
+		bool bUnresolved = false;
+		for (int32 i = 0; i < NumMats; ++i)
+		{
+			if (SMC->GetMaterial(i) == nullptr) { bUnresolved = true; break; }
+		}
+
+		++Total;
+		if (Mesh == nullptr) { ++NullMeshCount; } else { UniqueMeshes.Add(Mesh->GetPathName()); }
+		if (bHidden) { ++HiddenCount; }
+		if (bUnresolved) { ++UnresolvedCount; }
+
+		const int32 ThisIndex = MatchIndex++;
+		if (ThisIndex < Offset) { continue; }
+		if (Limit > 0 && Items.Num() >= Limit) { continue; }
+
+		TSharedRef<FJsonObject> Item = MakeShareable(new FJsonObject());
+		Item->SetStringField(TEXT("name"), ActorName);
+		Item->SetStringField(TEXT("label"), ActorLabel);
+		Item->SetStringField(TEXT("path"), SMA->GetPathName());
+		Item->SetStringField(TEXT("folder"), FolderPath);
+		if (Mesh != nullptr) { Item->SetStringField(TEXT("mesh"), Mesh->GetPathName()); }
+		else { Item->SetField(TEXT("mesh"), MakeShareable(new FJsonValueNull())); }
+		Item->SetObjectField(TEXT("transform"), MakeTransformJson(SMA->GetActorTransform()));
+		Item->SetBoolField(TEXT("hidden"), SMA->bHidden);
+		Item->SetBoolField(TEXT("hidden_ed"), SMA->IsHiddenEd());
+		Item->SetBoolField(TEXT("has_null_mesh"), Mesh == nullptr);
+		Item->SetBoolField(TEXT("has_unresolved_materials"), bUnresolved);
+		if (SMC != nullptr)
+		{
+			Item->SetObjectField(TEXT("component_transform"), MakeTransformJson(SMC->GetRelativeTransform()));
+			Item->SetStringField(TEXT("mobility"), MobilityToString(SMC->Mobility));
+			Item->SetStringField(TEXT("collision"), CollisionEnabledToString(SMC->GetCollisionEnabled()));
+			Item->SetBoolField(TEXT("visible"), SMC->IsVisible());
+
+			TArray<TSharedPtr<FJsonValue>> Slots;
+			for (int32 i = 0; i < NumMats; ++i)
+			{
+				UMaterialInterface* Mat = SMC->GetMaterial(i);
+				const bool bIsOverride = (i < SMC->OverrideMaterials.Num()) && (SMC->OverrideMaterials[i] != nullptr);
+				TSharedRef<FJsonObject> Slot = MakeShareable(new FJsonObject());
+				Slot->SetNumberField(TEXT("slot"), i);
+				if (Mat != nullptr) { Slot->SetStringField(TEXT("material"), Mat->GetPathName()); }
+				else { Slot->SetField(TEXT("material"), MakeShareable(new FJsonValueNull())); }
+				Slot->SetBoolField(TEXT("is_override"), bIsOverride);
+				Slots.Add(MakeShareable(new FJsonValueObject(Slot)));
+			}
+			Item->SetArrayField(TEXT("material_overrides"), Slots);
+		}
+		Items.Add(MakeShareable(new FJsonValueObject(Item)));
+	}
+
+	TSharedRef<FJsonObject> Summary = MakeShareable(new FJsonObject());
+	Summary->SetNumberField(TEXT("total_static_mesh_actors"), Total);
+	Summary->SetNumberField(TEXT("actors_null_mesh"), NullMeshCount);
+	Summary->SetNumberField(TEXT("unique_mesh_paths"), UniqueMeshes.Num());
+	Summary->SetNumberField(TEXT("actors_hidden"), HiddenCount);
+	Summary->SetNumberField(TEXT("actors_unresolved_materials"), UnresolvedCount);
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetArrayField(TEXT("actors"), Items);
+	Result->SetNumberField(TEXT("returned"), Items.Num());
+	Result->SetNumberField(TEXT("offset"), Offset);
+	Result->SetNumberField(TEXT("limit"), Limit);
+	Result->SetObjectField(TEXT("summary"), Summary);
 	return Result;
 }

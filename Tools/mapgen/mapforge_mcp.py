@@ -14,12 +14,18 @@ Setup:
 Register with Claude Code (stdio):
     claude mcp add mapforge -- python "<abs path>/Tools/mapgen/mapforge_mcp.py"
 """
-import json, os, re, socket
+import datetime, hashlib, json, os, re, socket, tempfile
 from mcp.server.fastmcp import FastMCP
 import emit  # same directory; emit.py guards __main__ so import is side-effect-free
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 mcp = FastMCP("mapforge")
+
+# Optional recovery-root override for this MCP layer. When set, it is forwarded
+# to the bridge's recovery_layout resolver so the two agree on the resolved root
+# (the bridge is the single source of truth; [MapForgeBridge] RecoveryRoot= is
+# its ini-level override, this env var is the MCP-level one).
+RECOVERY_ROOT = os.environ.get("MAPFORGE_RECOVERY_ROOT", "").strip()
 
 # ---- Layer B: live editor bridge (MapForgeBridge C++ module) -----------------
 # UnrealEd (with the LiandriMapForge plugin) listens on localhost with a
@@ -421,28 +427,49 @@ def forge_bp_graph(parent: str, package: str, graph_t3d: str, variables: list = 
 # ---- Static mesh import / configure / place ---------------------------------
 
 @mcp.tool()
-def bridge_import_static_mesh(source: str, destination: str, name: str = "",
+def bridge_import_static_mesh(source: str, destination: str = "", name: str = "",
                               overwrite: bool = False, save: bool = True,
-                              options: dict = None) -> dict:
+                              options: dict = None, map_name: str = "",
+                              category: str = "", recovery_root: str = "") -> dict:
     """Import an OBJ or FBX file as a UStaticMesh into the open editor -- no
     modal dialog, no GEditor->Exec (uses the automated FBX/OBJ factory path).
-    'source' is an absolute local .obj/.fbx path; 'destination' a /Game content
-    folder; 'name' the asset name (defaults to the file's base name). 'options'
-    (all optional, with defaults): combine_meshes(true), import_materials(false),
+    'source' is an absolute local .obj/.fbx path.
+
+    Destination: pass an explicit 'destination' /Game folder (unchanged, backward
+    compatible), OR leave it empty to route through the canonical map-scoped
+    recovery layout: <RecoveryRoot>/<MapSlug>/<category>. 'map_name' selects the
+    slug (inferred from the current map when omitted); 'category' is one of Maps,
+    Geometry/BSP, Geometry/StaticMeshes (default), Materials, Textures, VFX,
+    Audio, Blueprints, Data (arbitrary/traversal categories are rejected).
+    e.g. map_name='DM-Andok_Scaled', category='Geometry/BSP' ->
+    /Game/RecoveredMaps/DM-Andok_Scaled/Geometry/BSP/<name>.
+
+    'name' the asset name (defaults to the file's base name). 'options' (all
+    optional, with defaults): combine_meshes(true), import_materials(false),
     import_textures(false), generate_lightmap_uvs(true), compute_normals(true),
     use_mikk_tspace(false), collision ("none"|"simple"|"complex_as_simple"),
-    lightmap_coordinate_index(1). Fails cleanly (no prompt) if the target exists
-    and overwrite is false. Only .obj/.fbx are allowed -- never .umap/arbitrary
-    packages. Returns asset/package path, class, source, created/overwritten,
-    saved, and mesh stats (material_slot_count, lod0_vertices/triangles,
-    uv_channels, bounds, collision_trace_mode, simple_collision_primitives) plus
-    warnings. Importing a mesh does NOT save the current map."""
-    args = {"source": source, "destination": destination,
-            "overwrite": overwrite, "save": save}
+    lightmap_coordinate_index(1). For multi-material OBJs the referenced .mtl
+    sidecar(s) are staged beside the OBJ so every usemtl group keeps its own
+    material slot. Fails cleanly (no prompt) if the target exists and overwrite
+    is false. Only .obj/.fbx are allowed. Returns asset/package path, class,
+    source, resolved destination (+ recovery_layout when auto-resolved),
+    created/overwritten, saved, mesh stats (material_slot_count,
+    lod0_vertices/triangles, uv_channels, bounds, collision_trace_mode,
+    simple_collision_primitives) and warnings. Does NOT save the current map."""
+    args = {"source": source, "overwrite": overwrite, "save": save}
+    if destination:
+        args["destination"] = destination
     if name:
         args["name"] = name
     if options:
         args["options"] = options
+    if map_name:
+        args["map_name"] = map_name
+    if category:
+        args["category"] = category
+    root = recovery_root or RECOVERY_ROOT
+    if root:
+        args["recovery_root"] = root
     return _bridge_call("import_static_mesh", args)
 
 
@@ -489,6 +516,244 @@ def bridge_place_static_mesh(asset: str, location: list = None, rotation: list =
     if folder:
         args["folder"] = folder
     return _bridge_call("place_static_mesh", args)
+
+
+# ---- SoundWave import / SoundCue authoring ----------------------------------
+
+@mcp.tool()
+def bridge_import_sound(source: str, destination: str, name: str = "",
+                        overwrite: bool = False, save: bool = True,
+                        looping: bool = False) -> dict:
+    """Import one 16-bit mono/stereo PCM WAV as a SoundWave without opening an
+    editor dialog. 'source' must be an absolute .wav path and 'destination' a
+    /Game content folder. 'name' defaults to the WAV basename. 'looping' sets
+    the SoundWave's native loop flag. Existing assets fail cleanly unless
+    overwrite=true; overwrite suppresses UE4's modal overwrite prompt. Returns
+    asset/package paths, duration, sample rate, channels, loop and save state.
+    This imports only the wave; use bridge_create_sound_cue for cue graphs."""
+    args = {
+        "source": source,
+        "destination": destination,
+        "overwrite": overwrite,
+        "save": save,
+        "looping": looping,
+    }
+    if name:
+        args["name"] = name
+    return _bridge_call("import_sound", args)
+
+
+@mcp.tool()
+def bridge_create_sound_cue(destination: str, name: str, waves: list,
+                            mode: str = "single", looping: bool = False,
+                            volume: float = 0.75, pitch: float = 1.0,
+                            modulator: dict = None, mixer_volumes: list = None,
+                            random_without_replacement: bool = True,
+                            overwrite: bool = False, save: bool = True) -> dict:
+    """Create a modal-free SoundCue graph from imported SoundWave asset paths.
+    mode='single' uses exactly one wave; 'random' selects one wave per play;
+    'mixer' layers all waves and optionally accepts one mixer_volumes value per
+    wave. looping marks every WavePlayer node as looping. Optional modulator keys
+    are pitch_min, pitch_max, volume_min and volume_max. The cue-level volume and
+    pitch multipliers are also configurable. Existing cues fail unless
+    overwrite=true. Returns the cue path, resolved waves, mode and node count."""
+    args = {
+        "destination": destination,
+        "name": name,
+        "waves": waves,
+        "mode": mode,
+        "looping": looping,
+        "volume": volume,
+        "pitch": pitch,
+        "random_without_replacement": random_without_replacement,
+        "overwrite": overwrite,
+        "save": save,
+    }
+    if modulator:
+        args["modulator"] = modulator
+    if mixer_volumes is not None:
+        args["mixer_volumes"] = mixer_volumes
+    return _bridge_call("create_sound_cue", args)
+
+
+# ---- Map-scoped recovery layout / audit -------------------------------------
+
+@mcp.tool()
+def bridge_recovery_layout(map_name: str = "", recovery_root: str = "") -> dict:
+    """Resolve the canonical map-scoped recovery layout (read-only). Returns the
+    editable Unreal content paths under <RecoveryRoot>/<MapSlug>/ (content_root,
+    maps, bsp, static_meshes, materials, textures, vfx, audio, blueprints, data)
+    plus the on-disk non-content paths under Saved/LiandriMapForge/Recoveries/
+    <MapSlug>/ (filesystem_root, raw_extract, interchange, manifests, reports).
+    'map_name' is inferred from the current map (recovery suffixes stripped) when
+    omitted. The root defaults to /Game/RecoveredMaps, overridable by the
+    recovery_root arg, the MAPFORGE_RECOVERY_ROOT env var, or [MapForgeBridge]
+    RecoveryRoot= in the editor ini."""
+    args = {}
+    if map_name:
+        args["map_name"] = map_name
+    root = recovery_root or RECOVERY_ROOT
+    if root:
+        args["recovery_root"] = root
+    return _bridge_call("recovery_layout", args)
+
+
+@mcp.tool()
+def bridge_inspect_static_mesh_actors(name_contains: str = "", folder_contains: str = "",
+                                      offset: int = 0, limit: int = 1000) -> dict:
+    """Read-only audit of every StaticMeshActor in the current level. Per actor:
+    name/label, path/folder, mesh object path (or null), actor + component
+    relative transform, hidden/visible state, mobility, collision enabled state,
+    and material overrides by slot. Pending-kill actors are excluded. Optional
+    name/folder substring filters and offset/limit pagination. Also returns
+    summary counts (total_static_mesh_actors, actors_null_mesh, unique_mesh_paths,
+    actors_hidden, actors_unresolved_materials). Does NOT dirty the map."""
+    return _bridge_call("inspect_static_mesh_actors", {
+        "name_contains": name_contains, "folder_contains": folder_contains,
+        "offset": offset, "limit": limit})
+
+
+def _sha256_file(path):
+    """SHA-256 of a file, streamed so large PAK/OBJ sources are fine."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _atomic_write_json(path, data):
+    """Write JSON to 'path' atomically (temp file in the same dir + os.replace),
+    creating parent dirs. Never leaves a partially written file at 'path'."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".manifest-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic on the same filesystem
+        tmp = None
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.remove(tmp)
+    return path
+
+
+@mcp.tool()
+def write_recovery_manifest(map_name: str = "", recovery_root: str = "",
+                            source_pak: str = "", source_map: str = "",
+                            imported_assets: list = None, source_files: list = None,
+                            material_substitutions: dict = None,
+                            actor_placement_counts: dict = None,
+                            warnings: list = None) -> dict:
+    """Write an atomic recovery manifest JSON to
+    Saved/LiandriMapForge/Recoveries/<MapSlug>/Manifests/recovery_manifest.json
+    (never inside Unreal's Content dir). Records the resolved layout, source PAK
+    and map paths, generated/imported asset paths, source filenames + SHA-256
+    hashes + sizes, material substitutions, actor placement counts,
+    warnings/failures, a UTC timestamp, and the plugin/engine version. Returns
+    {manifest_path, map_slug, wrote}."""
+    layout = bridge_recovery_layout(map_name=map_name, recovery_root=recovery_root)
+    files = []
+    for p in (source_files or []):
+        entry = {"path": p}
+        try:
+            entry["sha256"] = _sha256_file(p)
+            entry["size"] = os.path.getsize(p)
+        except OSError as e:
+            entry["error"] = str(e)
+        files.append(entry)
+    engine = None
+    try:
+        engine = bridge_status().get("engine")
+    except BridgeError:
+        pass
+    manifest = {
+        "plugin": "LiandriMapForge",
+        "engine": engine,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "map_slug": layout["map_slug"],
+        "layout": layout,
+        "source_pak": source_pak or None,
+        "source_map": source_map or None,
+        "imported_assets": imported_assets or [],
+        "source_files": files,
+        "material_substitutions": material_substitutions or {},
+        "actor_placement_counts": actor_placement_counts or {},
+        "warnings": warnings or [],
+    }
+    out_path = os.path.join(layout["manifests"], "recovery_manifest.json")
+    _atomic_write_json(out_path, manifest)
+    return {"manifest_path": out_path, "map_slug": layout["map_slug"], "wrote": True}
+
+
+def _transform_close(a, b, tol=0.5):
+    """True when two transform dicts agree within 'tol' on every present axis
+    (location/scale use x/y/z, rotation uses pitch/yaw/roll)."""
+    for comp in ("location", "rotation", "scale"):
+        av, bv = a.get(comp, {}) or {}, b.get(comp, {}) or {}
+        for k in set(av) | set(bv):
+            if abs(float(av.get(k, 0.0)) - float(bv.get(k, 0.0))) > tol:
+                return False
+    return True
+
+
+def _diff_actors(inspection, manifest, transform_tol=0.5):
+    """Pure comparison of an inspect_static_mesh_actors result against an actors
+    manifest ({"actors": [{name/label, mesh, transform?, material_overrides?}]}).
+    Mutates nothing; returns categorized differences."""
+    def key(a):
+        return a.get("name") or a.get("label")
+    want = {key(a): a for a in manifest.get("actors", []) if key(a)}
+    have = {key(a): a for a in inspection.get("actors", []) if key(a)}
+    missing = sorted(k for k in want if k not in have)
+    extra = sorted(k for k in have if k not in want)
+    null_mesh = sorted(k for k, a in have.items() if a.get("mesh") is None)
+    substitutions, transform_mismatches, missing_overrides = [], [], []
+    for k in sorted(set(want) & set(have)):
+        w, h = want[k], have[k]
+        wm, hm = w.get("mesh"), h.get("mesh")
+        if wm and hm and wm != hm:
+            substitutions.append({"actor": k, "expected": wm, "actual": hm})
+        wt, ht = w.get("transform"), h.get("transform")
+        if wt and ht and not _transform_close(wt, ht, transform_tol):
+            transform_mismatches.append({"actor": k, "expected": wt, "actual": ht})
+        want_ov = {int(s["slot"]): s.get("material")
+                   for s in w.get("material_overrides", []) if s.get("is_override")}
+        have_ov = {int(s["slot"]): s.get("material")
+                   for s in h.get("material_overrides", []) if s.get("is_override")}
+        for slot, mat in sorted(want_ov.items()):
+            if slot not in have_ov or have_ov[slot] != mat:
+                missing_overrides.append({"actor": k, "slot": slot,
+                                          "expected": mat, "actual": have_ov.get(slot)})
+    return {
+        "missing_actors": missing,
+        "extra_actors": extra,
+        "null_mesh_actors": null_mesh,
+        "mesh_substitutions": substitutions,
+        "transform_mismatches": transform_mismatches,
+        "missing_material_overrides": missing_overrides,
+        "ok": not (missing or null_mesh or substitutions
+                   or transform_mismatches or missing_overrides),
+    }
+
+
+@mcp.tool()
+def audit_static_mesh_actors(actors_manifest_path: str, name_contains: str = "",
+                             folder_contains: str = "", transform_tol: float = 0.5) -> dict:
+    """Compare the live StaticMeshActors against an actors_manifest.json and
+    report missing_actors, extra_actors, null_mesh_actors, mesh_substitutions,
+    transform_mismatches, and missing_material_overrides (plus the live summary).
+    Read-only; mutates nothing in the editor or on disk."""
+    with open(actors_manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    inspection = bridge_inspect_static_mesh_actors(
+        name_contains=name_contains, folder_contains=folder_contains, limit=1000000)
+    diff = _diff_actors(inspection, manifest, transform_tol)
+    diff["summary"] = inspection.get("summary")
+    return diff
 
 
 if __name__ == "__main__":
