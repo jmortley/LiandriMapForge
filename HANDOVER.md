@@ -4,6 +4,9 @@
 > **UT4X-Converter** integration. Read this first if you're picking the project
 > up cold. Companion docs: `README.md` (user-facing reference), `NEXT.md`
 > (continuation prompt / uncommitted-work log).
+>
+> _Last updated 2026-07-15 (recovery pipeline + sound verbs committed & pushed as
+> `80b8272`). **Current state, LA-pickup order, and the Clutch map task: §8–§9.**_
 
 ---
 
@@ -377,9 +380,58 @@ audit correctly flags as `actors_unresolved_materials`. Acceptable for an MVP.
 
 ---
 
-## 8. Current state & next steps
+## 8. Clutch map build (CL-Crucible) — creative next task
 
-**Uncommitted (pending phantaci's build + smoke test):**
+Build a **Clutch (CL)** map through the editor connector. Clutch is NetcodePlus's
+ShootMania-*Elite* mode. A full copy-paste build prompt was drafted in the
+2026-07-15 session (ask the assistant to re-emit "the CL-Crucible build prompt");
+the essentials are captured here so the task survives a fresh session.
+
+**Authoritative mechanics** (`Plugins/NetcodePlus/Source/{Public,Private}/ClutchGameMode.{h,cpp}`,
+`ClutchRoundState.h`):
+- **3v3, one attacker per round** (sniper/rail, dies in **3** defender hits ≈300hp)
+  vs **3 defenders** (rockets); teams alternate attacking.
+- **60s** round, pole **locked the first 45s** (`PoleUnlockDelay`), then **7s**
+  uncontested to capture; capture cylinder **radius 180uu / half-height 160uu**.
+- Objective = one central actor **tagged `ClutchPole`** (an FName tag —
+  `place_static_mesh` can't set tags, so author the pole as a **T3D
+  `StaticMeshActor` with `Tags(0)="ClutchPole"`**). `bUseRecoveredPoleVisual=true`
+  may spawn its own pole visual — watch for a double-up at playtest.
+- Win priority: timeout→defenders, all-defenders-dead→attacker, attacker-dead→
+  defenders, pole→attacker.
+
+**Design brief (constraints):**
+- **Point-symmetric** (either team attacks fairly) but not boring — asymmetric
+  routes inside the symmetry. **No flat rectangle.**
+- **Scale = CTF-Quick** (measure it in-editor; ~16k×11k uu working target — it's
+  compact/symmetrical, not a giant field).
+- **Cover-dense à la FR-Meltdown** (a UT4 Flag-Run map — attacker-vs-defender, like
+  Clutch): staggered chest-high peek-cover, densest **around the pole** (defenders
+  hold it vs a one-shot sniper); long sightlines **broken by pillars** (sniper
+  viable, never a gallery — Elite "peek-and-cover").
+- **Verticality + flanks:** ramps, a ±Y catwalk/trench pair, 2–3 jump pads, two
+  contestable sniper perches. The lone attacker needs repositioning vs 3.
+- **Materials = deck + solo:** deck (Liandri concrete/orange) base shell + floors;
+  solo (Shell tech-grey) for cover / high-ground / the dais (readability); orange
+  trim for orientation. Optional `SlimePit` sludge in the central moat.
+- **Pole mesh:** `SM_DarkHell_Pole`, object path
+  `/NetcodePlus/Clutch/Objective/SM_DarkHell_Pole.SM_DarkHell_Pole` (plugin content
+  mounts as `/NetcodePlus/…`, **not** `/Game/…` — verify with `preload_assets`).
+- **Spawns:** `AUTTeamPlayerStart`, TeamNum 0/1, 3 per bastion.
+
+**Build path (connector):** geometry as additive BSP — MapSpec + `emit.py`
+`box_brush`/ramp T3D → `bridge_import_t3d` + `bridge_rebuild_geometry`; pole +
+spawns + lights as tagged T3D actors; cover props via `bridge_place_static_mesh`;
+verify with `bridge_inspect_static_mesh_actors` (no null meshes); don't save the
+level unless asked. Creative refs: [ShootMania Elite](https://liquipedia.net/arenafps/Shootmania_Storm),
+[FR-Meltdown](https://unreal.fandom.com/wiki/FR-Meltdown), [CTF-Quick](https://unreal.fandom.com/wiki/CTF-Quick).
+
+---
+
+## 9. Current state & next steps
+
+**Committed & pushed** (`80b8272` on `main`, `github.com/jmortley/LiandriMapForge`) —
+pending an **editor build + smoke test** (the C++ is not yet compiled):
 - Static-mesh import/configure/place + `exec` hardening.
 - **MTL-sidecar staging** for multi-material OBJs (+ `cube_two_materials` &
   `traversal_mtllib` fixtures).
@@ -388,19 +440,20 @@ audit correctly flags as `actors_unresolved_materials`. Acceptable for an MVP.
   `write_recovery_manifest`, `audit_static_mesh_actors`, offline tests).
 - **Sound import**: `import_sound` (WAV) + `create_sound_cue`.
 
-Committed baseline: bridge v2 (`1b2e1ec`: audit hardening + physics-asset forge +
+Prior baseline: bridge v2 (`1b2e1ec`: audit hardening + physics-asset forge +
 Blueprint Tiers 1–2).
 
-**Immediate next steps:**
-1. phantaci builds (§5) + restarts the editor + runs both test suites.
+**Immediate next steps (LA-pickup order):**
+1. Build the editor (§5) + restart + run both suites — `test_recovery_offline.py`
+   is editor-free (passes now); `bridge_smoke.py` needs the running editor.
 2. Re-run the 14-material **Andok acceptance OBJ**; confirm all 14 slots.
-3. **UT4X-Converter Phase 0 spike** (§7.5) against a real `Converted/<Map>/`
-   folder — de-risks the whole integration before writing glue.
-4. Resolve the three integration decisions (§7.6), then Phase 1.
+3. **Build the Clutch map** (§8) via the connector — the fun one.
+4. **UT4X-Converter Phase 0 spike** (§7.5) against a real `Converted/<Map>/` folder;
+   then resolve the three integration decisions (§7.6) and start Phase 1.
 
 ---
 
-## 9. References
+## 10. References
 
 - **Plugin:** `Plugins/LiandriMapForge` — repo `github.com/jmortley/LiandriMapForge` (`main`).
 - **Docs:** `README.md` (reference), `NEXT.md` (continuation prompt / work log),
@@ -413,5 +466,9 @@ Blueprint Tiers 1–2).
   `C:\Users\MrJmo\.claude\projects\C--UnrealTournament-UnrealTournament\memory\` —
   `mapforge-project.md`, `ut4x-converter-integration.md`, `laeditorut4-two-tree-setup.md`,
   `ut4-cli-build-vulkan-gotcha.md`, `dont-run-builds.md`, `ut4stats-map-bounds.md`.
+- **Clutch mode (for §8):** `Plugins/NetcodePlus/Source/{Public,Private}/ClutchGameMode.{h,cpp}`,
+  `ClutchRoundState.h`; pole asset
+  `Plugins/NetcodePlus/Content/Clutch/Objective/SM_DarkHell_Pole.uasset`
+  (mounts as `/NetcodePlus/Clutch/Objective/SM_DarkHell_Pole`).
 - **Related projects:** NetcodePlus (sibling plugin), UTVehicles
   (`Plugins/UTVehicles`, repo `jmortley/UT4Vehicles`).
