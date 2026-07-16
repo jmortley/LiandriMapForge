@@ -430,8 +430,11 @@ level unless asked. Creative refs: [ShootMania Elite](https://liquipedia.net/are
 
 ## 9. Current state & next steps
 
-**Committed & pushed** (`80b8272` on `main`, `github.com/jmortley/LiandriMapForge`) —
-pending an **editor build + smoke test** (the C++ is not yet compiled):
+**Committed & pushed** (`80b8272` on `main`, `github.com/jmortley/LiandriMapForge`) **and
+built** — `Binaries/Win64/UE4Editor-MapForgeBridge.dll` (2026-07-14 21:30) is newer than
+every source input, so it contains everything below. Shipped as release
+[`v0.2`](https://github.com/jmortley/LiandriMapForge/releases/tag/v0.2) (editor DLL only;
+`Binaries/` is gitignored). **The live smoke test is still unconfirmed:**
 - Static-mesh import/configure/place + `exec` hardening.
 - **MTL-sidecar staging** for multi-material OBJs (+ `cube_two_materials` &
   `traversal_mtllib` fixtures).

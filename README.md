@@ -1,13 +1,39 @@
 # LiandriMapForge
 
-AI-authored maps for **UnrealTournament (UE4 4.15 fork)**. Point an LLM at the game, get a playable map — but for UT4, seeded
-by the [ElimPlus map layouts](https://ut4stats.com/elimplus_maps).
+A **mini MCP server for the UnrealTournament editor** (UE4 4.15 fork). It exposes
+UnrealEd's own import / build / asset machinery over a localhost JSON-lines bridge, so any
+MCP client — **Claude Code, Codex, Claude Desktop** — can drive the editor directly: author
+maps, bulk-import and configure assets, author Blueprints, and audit or recover content.
+The UE4.15 analog of Epic's UE5.8 editor MCP, for the engine Epic's tooling will never run on.
 
 > Standalone **editor-only** plugin, its own repo (sibling to NetcodePlus under
 > `Plugins/`). Nothing here ships in a runtime/game build. The AI stays *outside*
 > the editor — LiandriMapForge only exposes the editor's own command/import machinery.
 
-## The lever
+## What it's for
+
+It started as "point an LLM at the game, get a playable map" — seeded by the
+[ElimPlus map layouts](https://ut4stats.com/elimplus_maps) — and that still works (see
+**The lever** below). But in practice the bridge is a general **editor automation** surface:
+
+- **Batch asset work** — mass-import and configure assets with no modal dialogs, no
+  clicking. Real example: **Codex bulk-imported the audio library for the
+  [UTVehicles](https://github.com/jmortley/UT4Vehicles) project** through `import_sound` /
+  `create_sound_cue`.
+- **Asset authoring** — static meshes (import / configure / place, incl. multi-material
+  OBJs), sound waves + cues, physics assets (`forge_chassis_physasset`), and Blueprints
+  (subclass + CDO defaults, plus real graph logic via a clipboard-text round-trip).
+- **Map authoring** — MapSpec → T3D → live geometry in one shot (`forge_mapspec`).
+- **Map recovery + audit** — a map-scoped recovery layout, provenance manifests, and a
+  read-only `StaticMeshActor` audit that answers *"did that import actually land?"*
+- **Whatever the editor can already do** — the bridge is a thin, source-verified wrapper
+  over UnrealEd's existing commands, not a new engine API.
+
+Two layers: a **stateless emitter** (MapSpec → T3D, no editor needed) and the **live
+bridge** (C++ editor module on `127.0.0.1:8765`), both fronted by the `mapforge` MCP
+connector (`Tools/mapgen/mapforge_mcp.py`).
+
+## The lever (map authoring)
 
 `.umap` is a binary UE4 package and this 4.15 fork has **no Python editor plugin**,
 so the mainstream "UnrealMCP" path is out. But this engine's editor round-trips
