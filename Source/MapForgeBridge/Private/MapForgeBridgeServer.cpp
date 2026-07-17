@@ -13,6 +13,10 @@
 #include "GameFramework/WorldSettings.h"
 #include "Model.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInstance.h"
+#include "Materials/MaterialInstanceConstant.h"
+#include "Engine/Texture.h"
 #include "Engine/SkeletalMesh.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "PhysicsEngine/BodySetup.h"
@@ -88,7 +92,8 @@ namespace
 			|| Cmd == TEXT("configure_static_mesh")
 			|| Cmd == TEXT("place_static_mesh")
 			|| Cmd == TEXT("import_sound")
-			|| Cmd == TEXT("create_sound_cue");
+			|| Cmd == TEXT("create_sound_cue")
+			|| Cmd == TEXT("set_material_params");
 	}
 
 	/** Reject command families that can load/replace the whole map or otherwise
@@ -557,9 +562,11 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::Dispatch(const FString& Cmd, cons
 	if (Cmd == TEXT("place_static_mesh"))                       { return CmdPlaceStaticMesh(World, Args, OutError); }
 	if (Cmd == TEXT("import_sound"))                            { return CmdImportSound(World, Args, OutError); }
 	if (Cmd == TEXT("create_sound_cue"))                       { return CmdCreateSoundCue(World, Args, OutError); }
+	if (Cmd == TEXT("set_material_params"))                     { return CmdSetMaterialParams(World, Args, OutError); }
 	// Read-only recovery helpers -- deliberately NOT in IsMutatingCmd.
 	if (Cmd == TEXT("recovery_layout"))                         { return CmdRecoveryLayout(World, Args, OutError); }
 	if (Cmd == TEXT("inspect_static_mesh_actors"))              { return CmdInspectStaticMeshActors(World, Args, OutError); }
+	if (Cmd == TEXT("inspect_material"))                        { return CmdInspectMaterial(World, Args, OutError); }
 
 	OutError = FString::Printf(TEXT("unknown cmd '%s'"), *Cmd);
 	return nullptr;
@@ -3215,5 +3222,247 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdInspectStaticMeshActors(UWorld
 	Result->SetNumberField(TEXT("offset"), Offset);
 	Result->SetNumberField(TEXT("limit"), Limit);
 	Result->SetObjectField(TEXT("summary"), Summary);
+	return Result;
+}
+
+namespace
+{
+	TArray<TSharedPtr<FJsonValue>> JsonRgba(const FLinearColor& C)
+	{
+		TArray<TSharedPtr<FJsonValue>> Rgba;
+		Rgba.Add(MakeShareable(new FJsonValueNumber(C.R)));
+		Rgba.Add(MakeShareable(new FJsonValueNumber(C.G)));
+		Rgba.Add(MakeShareable(new FJsonValueNumber(C.B)));
+		Rgba.Add(MakeShareable(new FJsonValueNumber(C.A)));
+		return Rgba;
+	}
+
+	UMaterialInterface* LoadMaterialArg(const TSharedRef<FJsonObject>& Args, FString& OutError)
+	{
+		FString AssetArg;
+		if (!Args->TryGetStringField(TEXT("asset"), AssetArg) || AssetArg.IsEmpty())
+		{
+			OutError = TEXT("missing 'asset'");
+			return nullptr;
+		}
+		FString ObjectPath = AssetArg;
+		if (!ObjectPath.Contains(TEXT(".")))
+		{
+			ObjectPath = AssetArg + TEXT(".") + FPackageName::GetShortName(AssetArg);
+		}
+		UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *ObjectPath);
+		if (Mat == nullptr)
+		{
+			OutError = FString::Printf(TEXT("could not load material '%s'"), *AssetArg);
+		}
+		return Mat;
+	}
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdInspectMaterial(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	UMaterialInterface* Mat = LoadMaterialArg(Args, OutError);
+	if (Mat == nullptr)
+	{
+		return nullptr;
+	}
+
+	UMaterialInstance* Inst = Cast<UMaterialInstance>(Mat);
+	UMaterial* Root = Mat->GetMaterial();
+
+	// Overrides stored on the instance itself (all empty for a base material).
+	TSharedRef<FJsonObject> Scalars = MakeShareable(new FJsonObject());
+	TSharedRef<FJsonObject> Vectors = MakeShareable(new FJsonObject());
+	TSharedRef<FJsonObject> Textures = MakeShareable(new FJsonObject());
+	if (Inst != nullptr)
+	{
+		for (const FScalarParameterValue& S : Inst->ScalarParameterValues)
+		{
+			Scalars->SetNumberField(S.ParameterName.ToString(), S.ParameterValue);
+		}
+		for (const FVectorParameterValue& V : Inst->VectorParameterValues)
+		{
+			Vectors->SetArrayField(V.ParameterName.ToString(), JsonRgba(V.ParameterValue));
+		}
+		for (const FTextureParameterValue& T : Inst->TextureParameterValues)
+		{
+			Textures->SetStringField(T.ParameterName.ToString(),
+				T.ParameterValue ? T.ParameterValue->GetPathName() : TEXT(""));
+		}
+	}
+	TSharedRef<FJsonObject> Overrides = MakeShareable(new FJsonObject());
+	Overrides->SetObjectField(TEXT("scalars"), Scalars);
+	Overrides->SetObjectField(TEXT("vectors"), Vectors);
+	Overrides->SetObjectField(TEXT("textures"), Textures);
+
+	// Every parameter the root master exposes, resolved through the parent
+	// chain from the queried object -- the values this asset renders with.
+	// Params defined inside material functions are invisible to
+	// GetAll*ParameterNames (4.15 walks top-level expressions only).
+	TSharedRef<FJsonObject> AvailScalars = MakeShareable(new FJsonObject());
+	TSharedRef<FJsonObject> AvailVectors = MakeShareable(new FJsonObject());
+	if (Root != nullptr)
+	{
+		TArray<FName> Names;
+		TArray<FGuid> Guids;
+		Root->GetAllScalarParameterNames(Names, Guids);
+		for (const FName& Name : Names)
+		{
+			float Value = 0.f;
+			Mat->GetScalarParameterValue(Name, Value);
+			AvailScalars->SetNumberField(Name.ToString(), Value);
+		}
+		Names.Reset();
+		Guids.Reset();
+		Root->GetAllVectorParameterNames(Names, Guids);
+		for (const FName& Name : Names)
+		{
+			FLinearColor Value(ForceInit);
+			Mat->GetVectorParameterValue(Name, Value);
+			AvailVectors->SetArrayField(Name.ToString(), JsonRgba(Value));
+		}
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Mat->GetPathName());
+	Result->SetStringField(TEXT("class"), Mat->GetClass()->GetName());
+	Result->SetStringField(TEXT("parent"), (Inst != nullptr && Inst->Parent != nullptr) ? Inst->Parent->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("root_material"), Root != nullptr ? Root->GetPathName() : TEXT(""));
+	Result->SetObjectField(TEXT("overrides"), Overrides);
+	Result->SetObjectField(TEXT("available_scalars"), AvailScalars);
+	Result->SetObjectField(TEXT("available_vectors"), AvailVectors);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdSetMaterialParams(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	UMaterialInterface* Mat = LoadMaterialArg(Args, OutError);
+	if (Mat == nullptr)
+	{
+		return nullptr;
+	}
+	// The EditorOnly setters live on constant instances; base materials would
+	// need graph edits and MIDs are transient -- both out of scope here.
+	UMaterialInstanceConstant* MIC = Cast<UMaterialInstanceConstant>(Mat);
+	if (MIC == nullptr)
+	{
+		OutError = FString::Printf(TEXT("'%s' is a %s, not a MaterialInstanceConstant"),
+			*Mat->GetPathName(), *Mat->GetClass()->GetName());
+		return nullptr;
+	}
+
+	const TSharedPtr<FJsonObject>* ScalarsPtr = nullptr;
+	const TSharedPtr<FJsonObject>* VectorsPtr = nullptr;
+	const bool bHasScalars = Args->TryGetObjectField(TEXT("scalars"), ScalarsPtr)
+		&& ScalarsPtr != nullptr && ScalarsPtr->IsValid() && (*ScalarsPtr)->Values.Num() > 0;
+	const bool bHasVectors = Args->TryGetObjectField(TEXT("vectors"), VectorsPtr)
+		&& VectorsPtr != nullptr && VectorsPtr->IsValid() && (*VectorsPtr)->Values.Num() > 0;
+	if (!bHasScalars && !bHasVectors)
+	{
+		OutError = TEXT("nothing to set: pass 'scalars' {name: float} and/or 'vectors' {name: [r,g,b] or [r,g,b,a]}");
+		return nullptr;
+	}
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+
+	// Parse and validate everything before touching the asset so a bad arg
+	// can't leave a half-applied instance behind. (Local structs -- this
+	// fork's TPair has no two-argument constructor for Emplace to forward to.)
+	struct FScalarSet { FName Name; float Value; };
+	struct FVectorSet { FName Name; FLinearColor Value; };
+	TArray<FScalarSet> ScalarSets;
+	TArray<FVectorSet> VectorSets;
+	if (bHasScalars)
+	{
+		for (const auto& Pair : (*ScalarsPtr)->Values)
+		{
+			double Value = 0.0;
+			if (!Pair.Value.IsValid() || !Pair.Value->TryGetNumber(Value))
+			{
+				OutError = FString::Printf(TEXT("scalar '%s' must be a number"), *Pair.Key);
+				return nullptr;
+			}
+			ScalarSets.Add({ FName(*Pair.Key), (float)Value });
+		}
+	}
+	if (bHasVectors)
+	{
+		for (const auto& Pair : (*VectorsPtr)->Values)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+			if (!Pair.Value.IsValid() || !Pair.Value->TryGetArray(Arr) || Arr == nullptr
+				|| (Arr->Num() != 3 && Arr->Num() != 4))
+			{
+				OutError = FString::Printf(TEXT("vector '%s' must be [r,g,b] or [r,g,b,a]"), *Pair.Key);
+				return nullptr;
+			}
+			double Rgba[4] = { 0.0, 0.0, 0.0, 1.0 };
+			for (int32 Index = 0; Index < Arr->Num(); ++Index)
+			{
+				if (!(*Arr)[Index].IsValid() || !(*Arr)[Index]->TryGetNumber(Rgba[Index]))
+				{
+					OutError = FString::Printf(TEXT("vector '%s'[%d] must be a number"), *Pair.Key, Index);
+					return nullptr;
+				}
+			}
+			VectorSets.Add({ FName(*Pair.Key),
+				FLinearColor((float)Rgba[0], (float)Rgba[1], (float)Rgba[2], (float)Rgba[3]) });
+		}
+	}
+
+	// Unknown names still get an override recorded (harmless, just unused) --
+	// warn instead of rejecting so params defined inside material functions,
+	// which GetAll*ParameterNames can't see, stay settable.
+	TSet<FName> KnownScalars;
+	TSet<FName> KnownVectors;
+	if (UMaterial* Root = Mat->GetMaterial())
+	{
+		TArray<FName> Names;
+		TArray<FGuid> Guids;
+		Root->GetAllScalarParameterNames(Names, Guids);
+		KnownScalars.Append(Names);
+		Names.Reset();
+		Guids.Reset();
+		Root->GetAllVectorParameterNames(Names, Guids);
+		KnownVectors.Append(Names);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	TSharedRef<FJsonObject> AppliedScalars = MakeShareable(new FJsonObject());
+	for (const FScalarSet& Set : ScalarSets)
+	{
+		MIC->SetScalarParameterValueEditorOnly(Set.Name, Set.Value);
+		AppliedScalars->SetNumberField(Set.Name.ToString(), Set.Value);
+		if (KnownScalars.Num() > 0 && !KnownScalars.Contains(Set.Name))
+		{
+			Warnings.Add(MakeShareable(new FJsonValueString(FString::Printf(
+				TEXT("scalar '%s' is not exposed by the root material"), *Set.Name.ToString()))));
+		}
+	}
+	TSharedRef<FJsonObject> AppliedVectors = MakeShareable(new FJsonObject());
+	for (const FVectorSet& Set : VectorSets)
+	{
+		MIC->SetVectorParameterValueEditorOnly(Set.Name, Set.Value);
+		AppliedVectors->SetArrayField(Set.Name.ToString(), JsonRgba(Set.Value));
+		if (KnownVectors.Num() > 0 && !KnownVectors.Contains(Set.Name))
+		{
+			Warnings.Add(MakeShareable(new FJsonValueString(FString::Printf(
+				TEXT("vector '%s' is not exposed by the root material"), *Set.Name.ToString()))));
+		}
+	}
+
+	// The EditorOnly setters' documented contract: PostEditChange afterwards to
+	// propagate through the material chain and re-cache shaders.
+	MIC->PostEditChange();
+	MIC->MarkPackageDirty();
+	const bool bSaved = bSave ? SaveAssetPackage(MIC) : false;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), MIC->GetPathName());
+	Result->SetStringField(TEXT("parent"), MIC->Parent != nullptr ? MIC->Parent->GetPathName() : TEXT(""));
+	Result->SetObjectField(TEXT("applied_scalars"), AppliedScalars);
+	Result->SetObjectField(TEXT("applied_vectors"), AppliedVectors);
+	Result->SetArrayField(TEXT("warnings"), Warnings);
+	Result->SetBoolField(TEXT("saved"), bSaved);
 	return Result;
 }

@@ -109,10 +109,14 @@ private:
 	TSharedPtr<FJsonObject> CmdPlaceStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdImportSound(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdCreateSoundCue(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Set scalar/vector parameter overrides on a UMaterialInstanceConstant asset (and save). */
+	TSharedPtr<FJsonObject> CmdSetMaterialParams(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Read-only: resolve the canonical map-scoped recovery layout (content + Saved paths). */
 	TSharedPtr<FJsonObject> CmdRecoveryLayout(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Read-only: audit every StaticMeshActor in the current level (must not dirty the map). */
 	TSharedPtr<FJsonObject> CmdInspectStaticMeshActors(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Read-only: inspect a material/instance -- parent chain, overrides, available parameters. */
+	TSharedPtr<FJsonObject> CmdInspectMaterial(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 
 	FSocket* ListenSocket;
 	TArray<FMapForgeClient> Clients;

@@ -613,6 +613,36 @@ def bridge_inspect_static_mesh_actors(name_contains: str = "", folder_contains: 
         "offset": offset, "limit": limit})
 
 
+@mcp.tool()
+def bridge_inspect_material(asset: str) -> dict:
+    """Read-only inspect of a material or material instance: class, parent,
+    root master material, the instance's current scalar/vector/texture
+    parameter overrides, and every scalar/vector parameter the root master
+    exposes with the value the queried asset actually resolves to (through
+    the parent chain). Accepts a package path (/Game/A/M_Foo) or object path
+    (/Game/A/M_Foo.M_Foo). Params defined inside material functions are not
+    enumerable in 4.15 but can still be set. Never dirties anything."""
+    return _bridge_call("inspect_material", {"asset": asset})
+
+
+@mcp.tool()
+def bridge_set_material_params(asset: str, scalars: dict = None,
+                               vectors: dict = None, save: bool = True) -> dict:
+    """Set parameter overrides on a UMaterialInstanceConstant asset (persists,
+    unlike runtime MID edits). 'scalars' maps parameter name -> float;
+    'vectors' maps name -> [r,g,b] or [r,g,b,a] linear floats (HDR values > 1
+    allowed -- useful to brighten dark albedo via tint params). Names not
+    exposed by the root master are still applied but flagged in warnings.
+    save=True (default) writes the .uasset to disk. Mutating: rejected during
+    PIE/simulate and editor builds. Returns applied params + saved flag."""
+    args = {"asset": asset, "save": save}
+    if scalars:
+        args["scalars"] = scalars
+    if vectors:
+        args["vectors"] = vectors
+    return _bridge_call("set_material_params", args)
+
+
 def _sha256_file(path):
     """SHA-256 of a file, streamed so large PAK/OBJ sources are fine."""
     h = hashlib.sha256()
