@@ -93,7 +93,9 @@ namespace
 			|| Cmd == TEXT("place_static_mesh")
 			|| Cmd == TEXT("import_sound")
 			|| Cmd == TEXT("create_sound_cue")
-			|| Cmd == TEXT("set_material_params");
+			|| Cmd == TEXT("set_material_params")
+			|| Cmd == TEXT("duplicate_asset")
+			|| Cmd == TEXT("configure_skeletal_mesh");
 	}
 
 	/** Reject command families that can load/replace the whole map or otherwise
@@ -563,6 +565,8 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::Dispatch(const FString& Cmd, cons
 	if (Cmd == TEXT("import_sound"))                            { return CmdImportSound(World, Args, OutError); }
 	if (Cmd == TEXT("create_sound_cue"))                       { return CmdCreateSoundCue(World, Args, OutError); }
 	if (Cmd == TEXT("set_material_params"))                     { return CmdSetMaterialParams(World, Args, OutError); }
+	if (Cmd == TEXT("duplicate_asset"))                         { return CmdDuplicateAsset(World, Args, OutError); }
+	if (Cmd == TEXT("configure_skeletal_mesh"))                 { return CmdConfigureSkeletalMesh(World, Args, OutError); }
 	// Read-only recovery helpers -- deliberately NOT in IsMutatingCmd.
 	if (Cmd == TEXT("recovery_layout"))                         { return CmdRecoveryLayout(World, Args, OutError); }
 	if (Cmd == TEXT("inspect_static_mesh_actors"))              { return CmdInspectStaticMeshActors(World, Args, OutError); }
@@ -1770,21 +1774,43 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdSetClassDefaults(UWorld* World
 		return nullptr;
 	}
 
+	// Optional: apply the defaults to a default SUBOBJECT of the CDO instead
+	// (e.g. component="Mesh" to reach UTCharacterContent's Mesh->SkeletalMesh).
+	// The arg names the object-pointer PROPERTY holding the subobject.
+	UObject* Target = CDO;
+	FString ComponentArg;
+	if (Args->TryGetStringField(TEXT("component"), ComponentArg) && !ComponentArg.IsEmpty())
+	{
+		UObjectPropertyBase* CompProp = Cast<UObjectPropertyBase>(
+			FindField<UProperty>(Blueprint->GeneratedClass, *ComponentArg));
+		if (CompProp == nullptr)
+		{
+			OutError = FString::Printf(TEXT("'%s' is not an object property of the class"), *ComponentArg);
+			return nullptr;
+		}
+		Target = CompProp->GetObjectPropertyValue_InContainer(CDO);
+		if (Target == nullptr)
+		{
+			OutError = FString::Printf(TEXT("component property '%s' is null on the CDO"), *ComponentArg);
+			return nullptr;
+		}
+	}
+
 	const FScopedTransaction Transaction(FText::FromString(TEXT("MapForge Set Class Defaults")));
-	CDO->Modify();
+	Target->Modify();
 
 	TArray<TSharedPtr<FJsonValue>> Applied, Failed;
 	for (const auto& Pair : (*DefaultsPtr)->Values)
 	{
-		UProperty* Prop = FindField<UProperty>(Blueprint->GeneratedClass, *Pair.Key);
+		UProperty* Prop = FindField<UProperty>(Target->GetClass(), *Pair.Key);
 		if (Prop == nullptr)
 		{
 			Failed.Add(MakeShareable(new FJsonValueString(Pair.Key + TEXT(" (no such property)"))));
 			continue;
 		}
 		const FString ValueStr = JsonScalarToImportString(Pair.Value);
-		void* Dest = Prop->ContainerPtrToValuePtr<void>(CDO);
-		if (Prop->ImportText(*ValueStr, Dest, PPF_None, CDO) == nullptr)
+		void* Dest = Prop->ContainerPtrToValuePtr<void>(Target);
+		if (Prop->ImportText(*ValueStr, Dest, PPF_None, Target) == nullptr)
 		{
 			Failed.Add(MakeShareable(new FJsonValueString(Pair.Key + TEXT(" (could not import '") + ValueStr + TEXT("')"))));
 		}
@@ -3463,6 +3489,178 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdSetMaterialParams(UWorld* Worl
 	Result->SetObjectField(TEXT("applied_scalars"), AppliedScalars);
 	Result->SetObjectField(TEXT("applied_vectors"), AppliedVectors);
 	Result->SetArrayField(TEXT("warnings"), Warnings);
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdDuplicateAsset(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString SourceArg;
+	if (!Args->TryGetStringField(TEXT("source"), SourceArg) || SourceArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'source'");
+		return nullptr;
+	}
+	FString TargetArg;
+	if (!Args->TryGetStringField(TEXT("target"), TargetArg) || TargetArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'target' (long package path, e.g. /Game/A/B_Copy)");
+		return nullptr;
+	}
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+
+	FString SourceObjectPath = SourceArg;
+	if (!SourceObjectPath.Contains(TEXT(".")))
+	{
+		SourceObjectPath = SourceArg + TEXT(".") + FPackageName::GetShortName(SourceArg);
+	}
+	UObject* Source = LoadObject<UObject>(nullptr, *SourceObjectPath);
+	if (Source == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not load source asset '%s'"), *SourceArg);
+		return nullptr;
+	}
+
+	const FString TargetPackage = FPackageName::ObjectPathToPackageName(TargetArg);
+	if (!FPackageName::IsValidLongPackageName(TargetPackage))
+	{
+		OutError = FString::Printf(TEXT("invalid target package name '%s'"), *TargetPackage);
+		return nullptr;
+	}
+	const FString TargetShortName = FPackageName::GetShortName(TargetPackage);
+
+	UPackage* TargetPkg = CreatePackage(nullptr, *TargetPackage);
+	if (TargetPkg == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not create package '%s'"), *TargetPackage);
+		return nullptr;
+	}
+	if (TargetPkg == Source->GetOutermost())
+	{
+		OutError = TEXT("target resolves to the source's own package; choose a different 'target'");
+		return nullptr;
+	}
+	TargetPkg->FullyLoad();
+
+	// Clean overwrite: evict any prior object of this name in the package.
+	if (UObject* Existing = StaticFindObjectFast(nullptr, TargetPkg, FName(*TargetShortName)))
+	{
+		TrashObject(Existing);
+	}
+
+	UObject* Dup = StaticDuplicateObject(Source, TargetPkg, FName(*TargetShortName));
+	if (Dup == nullptr)
+	{
+		OutError = FString::Printf(TEXT("failed to duplicate '%s'"), *SourceObjectPath);
+		return nullptr;
+	}
+	Dup->SetFlags(RF_Public | RF_Standalone);
+	Dup->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(Dup);
+	const bool bSaved = bSave ? SaveAssetPackage(Dup) : false;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Dup->GetPathName());
+	Result->SetStringField(TEXT("class"), Dup->GetClass()->GetName());
+	Result->SetStringField(TEXT("source"), Source->GetPathName());
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdConfigureSkeletalMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString AssetArg;
+	if (!Args->TryGetStringField(TEXT("asset"), AssetArg) || AssetArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'asset'");
+		return nullptr;
+	}
+	FString ObjectPath = AssetArg;
+	if (!ObjectPath.Contains(TEXT(".")))
+	{
+		ObjectPath = AssetArg + TEXT(".") + FPackageName::GetShortName(AssetArg);
+	}
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, *ObjectPath);
+	if (Mesh == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not load skeletal mesh '%s'"), *AssetArg);
+		return nullptr;
+	}
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+
+	// Optional slot assignments {"<index>": "/Game/.../MI_Foo"}; with none this
+	// is a pure slot inspection and the asset is never dirtied.
+	const TSharedPtr<FJsonObject>* MatsPtr = nullptr;
+	const bool bHasMats = Args->TryGetObjectField(TEXT("materials"), MatsPtr)
+		&& MatsPtr != nullptr && MatsPtr->IsValid() && (*MatsPtr)->Values.Num() > 0;
+
+	int32 AssignedCount = 0;
+	if (bHasMats)
+	{
+		// Validate everything first so a bad slot/path can't half-apply.
+		TArray<int32> Indices;
+		TArray<UMaterialInterface*> NewMats;
+		for (const auto& Pair : (*MatsPtr)->Values)
+		{
+			if (!Pair.Key.IsNumeric())
+			{
+				OutError = FString::Printf(TEXT("material slot key '%s' must be a slot index"), *Pair.Key);
+				return nullptr;
+			}
+			const int32 SlotIndex = FCString::Atoi(*Pair.Key);
+			if (SlotIndex < 0 || SlotIndex >= Mesh->Materials.Num())
+			{
+				OutError = FString::Printf(TEXT("slot %d out of range (mesh has %d slots)"), SlotIndex, Mesh->Materials.Num());
+				return nullptr;
+			}
+			FString MatPath;
+			if (!Pair.Value.IsValid() || !Pair.Value->TryGetString(MatPath) || MatPath.IsEmpty())
+			{
+				OutError = FString::Printf(TEXT("slot %d needs a material object path"), SlotIndex);
+				return nullptr;
+			}
+			if (!MatPath.Contains(TEXT(".")))
+			{
+				MatPath = MatPath + TEXT(".") + FPackageName::GetShortName(MatPath);
+			}
+			UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *MatPath);
+			if (Mat == nullptr)
+			{
+				OutError = FString::Printf(TEXT("could not load material '%s' for slot %d"), *MatPath, SlotIndex);
+				return nullptr;
+			}
+			Indices.Add(SlotIndex);
+			NewMats.Add(Mat);
+		}
+		Mesh->Modify();
+		for (int32 i = 0; i < Indices.Num(); ++i)
+		{
+			Mesh->Materials[Indices[i]].MaterialInterface = NewMats[i];
+			++AssignedCount;
+		}
+		Mesh->PostEditChange();
+		Mesh->MarkPackageDirty();
+	}
+	const bool bSaved = (bHasMats && bSave) ? SaveAssetPackage(Mesh) : false;
+
+	TArray<TSharedPtr<FJsonValue>> Slots;
+	for (int32 i = 0; i < Mesh->Materials.Num(); ++i)
+	{
+		TSharedRef<FJsonObject> Slot = MakeShareable(new FJsonObject());
+		Slot->SetNumberField(TEXT("index"), i);
+		Slot->SetStringField(TEXT("slot_name"), Mesh->Materials[i].MaterialSlotName.ToString());
+		Slot->SetStringField(TEXT("material"), Mesh->Materials[i].MaterialInterface != nullptr
+			? Mesh->Materials[i].MaterialInterface->GetPathName() : TEXT(""));
+		Slots.Add(MakeShareable(new FJsonValueObject(Slot)));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Mesh->GetPathName());
+	Result->SetNumberField(TEXT("slot_count"), Mesh->Materials.Num());
+	Result->SetArrayField(TEXT("slots"), Slots);
+	Result->SetNumberField(TEXT("assigned"), AssignedCount);
 	Result->SetBoolField(TEXT("saved"), bSaved);
 	return Result;
 }

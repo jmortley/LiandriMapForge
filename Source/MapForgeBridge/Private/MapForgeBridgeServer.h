@@ -111,6 +111,10 @@ private:
 	TSharedPtr<FJsonObject> CmdCreateSoundCue(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Set scalar/vector parameter overrides on a UMaterialInstanceConstant asset (and save). */
 	TSharedPtr<FJsonObject> CmdSetMaterialParams(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Duplicate any asset into a new package (StaticDuplicateObject + save). */
+	TSharedPtr<FJsonObject> CmdDuplicateAsset(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Inspect/assign a USkeletalMesh's material slots (empty 'materials' = read-only slot listing). */
+	TSharedPtr<FJsonObject> CmdConfigureSkeletalMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Read-only: resolve the canonical map-scoped recovery layout (content + Saved paths). */
 	TSharedPtr<FJsonObject> CmdRecoveryLayout(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Read-only: audit every StaticMeshActor in the current level (must not dirty the map). */

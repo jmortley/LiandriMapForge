@@ -315,15 +315,21 @@ def bridge_create_blueprint(parent: str, package: str, name: str = "",
 
 
 @mcp.tool()
-def bridge_set_class_defaults(asset: str, defaults: dict) -> dict:
+def bridge_set_class_defaults(asset: str, defaults: dict, component: str = "") -> dict:
     """Override default (CDO) property values on a Blueprint class and save --
     the Tier-1 'config variant' path (no graph logic). 'defaults' maps property
     name -> value; bools/numbers are converted, and strings pass through as UE
     property literals (e.g. "(X=1,Y=2,Z=3)" for a struct, an enum name, or a
     class path). Inherited native properties of the parent mutator/gamemode
-    (bForceRespawn, TimeLimit, GoalScore, ...) are valid targets. Returns
-    {applied, failed, saved}."""
-    return _bridge_call("set_class_defaults", {"asset": asset, "defaults": defaults})
+    (bForceRespawn, TimeLimit, GoalScore, ...) are valid targets. Optional
+    'component' names an object-pointer property on the class whose default
+    SUBOBJECT receives the defaults instead -- e.g. component="Mesh",
+    defaults={"SkeletalMesh": "/Game/.../mesh.mesh"} repoints a character
+    content BP's mesh component. Returns {applied, failed, saved}."""
+    args = {"asset": asset, "defaults": defaults}
+    if component:
+        args["component"] = component
+    return _bridge_call("set_class_defaults", args)
 
 
 @mcp.tool()
@@ -611,6 +617,31 @@ def bridge_inspect_static_mesh_actors(name_contains: str = "", folder_contains: 
     return _bridge_call("inspect_static_mesh_actors", {
         "name_contains": name_contains, "folder_contains": folder_contains,
         "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def bridge_duplicate_asset(source: str, target: str, save: bool = True) -> dict:
+    """Duplicate any asset (mesh, material instance, sound, ...) into a new
+    package via StaticDuplicateObject. 'source' is a package or object path;
+    'target' is the new long package path (e.g. /Game/A/B_Bright -- the object
+    takes the package's short name). Overwrites an existing object of that name
+    in the target package. save=True (default) writes the new .uasset to disk.
+    Returns {asset, class, source, saved}."""
+    return _bridge_call("duplicate_asset", {"source": source, "target": target, "save": save})
+
+
+@mcp.tool()
+def bridge_configure_skeletal_mesh(asset: str, materials: dict = None, save: bool = True) -> dict:
+    """Inspect or reassign a USkeletalMesh's material slots. With no
+    'materials' this is a read-only slot listing (index, slot_name, material)
+    and never dirties the asset. 'materials' maps slot index -> material object
+    path, e.g. {"0": "/Game/.../MI_Bright_0"}; all slots/paths are validated
+    before anything is applied. save=True (default) writes the mesh package.
+    Returns {asset, slot_count, slots, assigned, saved}."""
+    args = {"asset": asset, "save": save}
+    if materials:
+        args["materials"] = materials
+    return _bridge_call("configure_skeletal_mesh", args)
 
 
 @mcp.tool()
