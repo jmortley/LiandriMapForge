@@ -103,14 +103,20 @@ private:
 	TSharedPtr<FJsonObject> CmdAddVariable(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdImportGraph(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdCompileBlueprint(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Reparent a Blueprint to a new (native or BP-generated) parent class, recompile, save. */
+	TSharedPtr<FJsonObject> CmdReparentBlueprint(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdExportGraph(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdImportStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Import an allow-listed UE3/UE4 Cascade ParticleSystem text export into a new asset. */
+	TSharedPtr<FJsonObject> CmdImportParticleT3D(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdConfigureStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdPlaceStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdImportSound(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	TSharedPtr<FJsonObject> CmdCreateSoundCue(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Set scalar/vector parameter overrides on a UMaterialInstanceConstant asset (and save). */
 	TSharedPtr<FJsonObject> CmdSetMaterialParams(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
+	/** Inject/update a camera-distance attenuation multiply on a base material's connected outputs. */
+	TSharedPtr<FJsonObject> CmdSetMaterialCameraFade(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Duplicate any asset into a new package (StaticDuplicateObject + save). */
 	TSharedPtr<FJsonObject> CmdDuplicateAsset(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError);
 	/** Inspect/assign a USkeletalMesh's material slots (empty 'materials' = read-only slot listing). */

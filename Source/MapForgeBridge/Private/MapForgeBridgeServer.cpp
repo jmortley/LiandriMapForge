@@ -16,6 +16,13 @@
 #include "Materials/Material.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceConstant.h"
+#include "Materials/MaterialExpressionCameraPositionWS.h"
+#include "Materials/MaterialExpressionObjectPositionWS.h"
+#include "Materials/MaterialExpressionDistance.h"
+#include "Materials/MaterialExpressionSubtract.h"
+#include "Materials/MaterialExpressionDivide.h"
+#include "Materials/MaterialExpressionClamp.h"
+#include "Materials/MaterialExpressionMultiply.h"
 #include "Engine/Texture.h"
 #include "Engine/SkeletalMesh.h"
 #include "PhysicsEngine/PhysicsAsset.h"
@@ -47,6 +54,15 @@
 #include "EditorFramework/AssetImportData.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
+#include "Particles/ParticleSystem.h"
+#include "Particles/ParticleEmitter.h"
+#include "Particles/ParticleLODLevel.h"
+#include "Particles/ParticleModule.h"
+#include "Particles/ParticleModuleRequired.h"
+#include "Particles/Spawn/ParticleModuleSpawn.h"
+#include "Particles/TypeData/ParticleModuleTypeDataBase.h"
+#include "Distributions/Distribution.h"
+#include "Distributions/DistributionFloat.h"
 #include "Components/StaticMeshComponent.h"
 #include "Sound/SoundCue.h"
 #include "Sound/SoundNode.h"
@@ -88,12 +104,15 @@ namespace
 			|| Cmd == TEXT("add_variable")
 			|| Cmd == TEXT("import_graph")
 			|| Cmd == TEXT("compile_blueprint")
+			|| Cmd == TEXT("reparent_blueprint")
 			|| Cmd == TEXT("import_static_mesh")
+			|| Cmd == TEXT("import_particle_t3d")
 			|| Cmd == TEXT("configure_static_mesh")
 			|| Cmd == TEXT("place_static_mesh")
 			|| Cmd == TEXT("import_sound")
 			|| Cmd == TEXT("create_sound_cue")
 			|| Cmd == TEXT("set_material_params")
+			|| Cmd == TEXT("set_material_camera_fade")
 			|| Cmd == TEXT("duplicate_asset")
 			|| Cmd == TEXT("configure_skeletal_mesh");
 	}
@@ -558,13 +577,16 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::Dispatch(const FString& Cmd, cons
 	if (Cmd == TEXT("add_variable"))                            { return CmdAddVariable(World, Args, OutError); }
 	if (Cmd == TEXT("import_graph"))                            { return CmdImportGraph(World, Args, OutError); }
 	if (Cmd == TEXT("compile_blueprint"))                       { return CmdCompileBlueprint(World, Args, OutError); }
+	if (Cmd == TEXT("reparent_blueprint"))                      { return CmdReparentBlueprint(World, Args, OutError); }
 	if (Cmd == TEXT("export_graph"))                            { return CmdExportGraph(World, Args, OutError); }
 	if (Cmd == TEXT("import_static_mesh"))                      { return CmdImportStaticMesh(World, Args, OutError); }
+	if (Cmd == TEXT("import_particle_t3d"))                     { return CmdImportParticleT3D(World, Args, OutError); }
 	if (Cmd == TEXT("configure_static_mesh"))                   { return CmdConfigureStaticMesh(World, Args, OutError); }
 	if (Cmd == TEXT("place_static_mesh"))                       { return CmdPlaceStaticMesh(World, Args, OutError); }
 	if (Cmd == TEXT("import_sound"))                            { return CmdImportSound(World, Args, OutError); }
 	if (Cmd == TEXT("create_sound_cue"))                       { return CmdCreateSoundCue(World, Args, OutError); }
 	if (Cmd == TEXT("set_material_params"))                     { return CmdSetMaterialParams(World, Args, OutError); }
+	if (Cmd == TEXT("set_material_camera_fade"))                { return CmdSetMaterialCameraFade(World, Args, OutError); }
 	if (Cmd == TEXT("duplicate_asset"))                         { return CmdDuplicateAsset(World, Args, OutError); }
 	if (Cmd == TEXT("configure_skeletal_mesh"))                 { return CmdConfigureSkeletalMesh(World, Args, OutError); }
 	// Read-only recovery helpers -- deliberately NOT in IsMutatingCmd.
@@ -2026,6 +2048,105 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdCompileBlueprint(UWorld* World
 	return Result;
 }
 
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdReparentBlueprint(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString AssetArg, ParentArg;
+	if (!Args->TryGetStringField(TEXT("asset"), AssetArg) || AssetArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'asset'");
+		return nullptr;
+	}
+	if (!Args->TryGetStringField(TEXT("new_parent"), ParentArg) || ParentArg.IsEmpty())
+	{
+		OutError = TEXT("missing 'new_parent'");
+		return nullptr;
+	}
+
+	UBlueprint* Blueprint = LoadBlueprintByRef(AssetArg);
+	if (Blueprint == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not load Blueprint '%s'"), *AssetArg);
+		return nullptr;
+	}
+
+	UClass* NewParent = ResolveClass(ParentArg);
+	if (NewParent == nullptr)
+	{
+		OutError = FString::Printf(TEXT("could not resolve new parent class '%s'"), *ParentArg);
+		return nullptr;
+	}
+	// Same gate create_blueprint uses. Abstract native classes pass (BPs are the
+	// concrete children); deprecated/newer-version classes do not.
+	if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(NewParent))
+	{
+		OutError = FString::Printf(TEXT("class '%s' cannot be a Blueprint parent"), *NewParent->GetName());
+		return nullptr;
+	}
+	// Refuse cycles: reparenting onto yourself or one of your own children.
+	if (Blueprint->GeneratedClass != nullptr &&
+		(NewParent == Blueprint->GeneratedClass || NewParent->IsChildOf(Blueprint->GeneratedClass)))
+	{
+		OutError = TEXT("new parent would create an inheritance cycle");
+		return nullptr;
+	}
+
+	UClass* OldParent = Blueprint->ParentClass;
+	const FString OldParentName = OldParent ? OldParent->GetPathName() : TEXT("None");
+
+	if (NewParent != OldParent)
+	{
+		// Mirrors FBlueprintEditor::ReparentBlueprint_NewParentChosen minus the
+		// dialogs: swap the parent, refresh every node against the new class
+		// layout, mark structurally modified, recompile. Property values that
+		// only existed on the old parent chain are dropped by the compile —
+		// callers should OBJ DUMP before/after when the old and new parents
+		// diverge (identical-default migrations, e.g. stock -> *_Plus, are safe).
+		Blueprint->ParentClass = NewParent;
+		FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		FKismetEditorUtilities::CompileBlueprint(Blueprint);
+	}
+
+	// Node-level diagnostics, same collection as compile_blueprint.
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	TArray<UEdGraph*> AllGraphs;
+	AllGraphs.Append(Blueprint->UbergraphPages);
+	AllGraphs.Append(Blueprint->FunctionGraphs);
+	for (UEdGraph* G : AllGraphs)
+	{
+		if (G == nullptr)
+		{
+			continue;
+		}
+		for (UEdGraphNode* Node : G->Nodes)
+		{
+			if (Node != nullptr && Node->bHasCompilerMessage && !Node->ErrorMsg.IsEmpty())
+			{
+				TSharedRef<FJsonObject> Entry = MakeShareable(new FJsonObject());
+				Entry->SetStringField(TEXT("graph"), G->GetName());
+				Entry->SetStringField(TEXT("node"), Node->GetName());
+				Entry->SetNumberField(TEXT("error_type"), Node->ErrorType);
+				Entry->SetStringField(TEXT("message"), Node->ErrorMsg);
+				Messages.Add(MakeShareable(new FJsonValueObject(Entry)));
+			}
+		}
+	}
+
+	const bool bSaved = SaveBlueprintPackage(Blueprint);
+	const EBlueprintStatus Status = Blueprint->Status;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Blueprint->GetPathName());
+	Result->SetStringField(TEXT("old_parent"), OldParentName);
+	Result->SetStringField(TEXT("new_parent"), NewParent->GetPathName());
+	Result->SetBoolField(TEXT("changed"), NewParent != OldParent);
+	Result->SetStringField(TEXT("status"), BlueprintStatusString(Status));
+	Result->SetBoolField(TEXT("ok"), Status == BS_UpToDate || Status == BS_UpToDateWithWarnings);
+	Result->SetArrayField(TEXT("messages"), Messages);
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	return Result;
+}
+
 TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdExportGraph(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
 {
 	FString AssetArg, GraphArg;
@@ -2273,6 +2394,877 @@ namespace
 		O->SetObjectField(TEXT("scale"), MakeVec3Json(T.GetScale3D()));
 		return O;
 	}
+
+	bool ClassOrAncestorNamed(const UClass* Class, const TCHAR* Name)
+	{
+		for (const UClass* It = Class; It != nullptr; It = It->GetSuperClass())
+		{
+			if (It->GetName() == Name)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** A deliberately narrow allow-list for object-text Cascade imports. Raw
+	    UObject T3D is effectively object construction, so this importer never
+	    accepts actors, components, Blueprints, or arbitrary editor classes. */
+	bool IsAllowedParticleSubobjectClass(const UClass* Class)
+	{
+		return Class != nullptr
+			&& (ClassOrAncestorNamed(Class, TEXT("ParticleEmitter"))
+				|| Class->GetName() == TEXT("ParticleLODLevel")
+				|| ClassOrAncestorNamed(Class, TEXT("ParticleModule"))
+				|| ClassOrAncestorNamed(Class, TEXT("Distribution"))
+				|| Class->GetName() == TEXT("InterpCurveEdSetup"));
+	}
+
+	/** Strip an optional export-text class wrapper from an object path, e.g.
+	    Material'/Game/A/M.M' -> /Game/A/M.M. */
+	FString BareExportObjectPath(const FString& In)
+	{
+		FString Out = In;
+		Out = Out.Trim();
+		Out = Out.TrimTrailing();
+		const int32 FirstQuote = Out.Find(TEXT("'"));
+		const int32 LastQuote = Out.Find(TEXT("'"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		if (FirstQuote != INDEX_NONE && LastQuote > FirstQuote)
+		{
+			Out = Out.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1);
+		}
+		return Out;
+	}
+
+	FString NormalizeObjectPath(const FString& In)
+	{
+		FString Out = BareExportObjectPath(In);
+		if (!Out.Contains(TEXT(".")))
+		{
+			Out += TEXT(".") + FPackageName::GetShortName(Out);
+		}
+		return Out;
+	}
+
+	/** Parsed object tree for a Cascade object-text export. Properties and
+	    subobjects are deliberately separated so imports never invoke a module's
+	    PostEditChange while its Outer/spawn data is still in UE3 form. */
+	struct FParticleTextNode
+	{
+		FString ClassName;
+		/** Name= identifies the destination subobject (and may match a constructor default). */
+		FString ObjectName;
+		/** ObjName= is the UE3 source identity used by exported object references. */
+		FString ExportObjectName;
+		UClass* ObjectClass = nullptr;
+		FParticleTextNode* Parent = nullptr;
+		TArray<TSharedPtr<FParticleTextNode>> Children;
+		TArray<FString> Properties;
+		UObject* CreatedObject = nullptr;
+	};
+
+	/** UnrealEd's GetBEGIN/GetEND helpers are not exported by this UT4 fork.
+	    Match the two-token object directives through Core's public parser. */
+	bool IsParticleObjectDirective(const FString& Line, const TCHAR* Directive)
+	{
+		const TCHAR* Cursor = *Line;
+		return FParse::Command(&Cursor, Directive)
+			&& FParse::Command(&Cursor, TEXT("Object"));
+	}
+
+	bool ParseParticleObjectText(const FString& InText,
+		TSharedPtr<FParticleTextNode>& OutRoot, int32& OutNodeCount, FString& OutErr)
+	{
+		TArray<FString> Lines;
+		InText.ParseIntoArrayLines(Lines, false);
+		TArray<TSharedPtr<FParticleTextNode>> Stack;
+		OutRoot.Reset();
+		OutNodeCount = 0;
+
+		for (const FString& RawLine : Lines)
+		{
+			FString Line = RawLine;
+			Line = Line.Trim();
+			Line = Line.TrimTrailing();
+			if (Line.IsEmpty())
+			{
+				continue;
+			}
+
+			if (IsParticleObjectDirective(Line, TEXT("Begin")))
+			{
+				FString ClassName;
+				FString SubobjectName;
+				if (!FParse::Value(*Line, TEXT("Class="), ClassName) || ClassName.IsEmpty()
+					|| !FParse::Value(*Line, TEXT("Name="), SubobjectName) || SubobjectName.IsEmpty())
+				{
+					OutErr = FString::Printf(TEXT("Begin Object requires Class= and Name=: %s"), *Line);
+					return false;
+				}
+				// UE3 particle exports use Name= for the owning property/subobject
+				// label and ObjName= for the UObject name referenced by module data.
+				// They frequently differ (for example DistributionStartSize versus
+				// ParticleModuleSize_DistributionStartSize_Class_0).
+				FString ExportedObjectName;
+				FParse::Value(*Line, TEXT("ObjName="), ExportedObjectName);
+				UClass* ObjectClass = FindObject<UClass>(ANY_PACKAGE, *ClassName);
+				if (ObjectClass == nullptr)
+				{
+					OutErr = FString::Printf(TEXT("particle T3D class '%s' is unavailable in this editor"), *ClassName);
+					return false;
+				}
+
+				if (Stack.Num() == 0)
+				{
+					if (OutRoot.IsValid() || ObjectClass->GetName() != TEXT("ParticleSystem"))
+					{
+						OutErr = TEXT("particle T3D must contain exactly one ParticleSystem root");
+						return false;
+					}
+				}
+				else if (!IsAllowedParticleSubobjectClass(ObjectClass))
+				{
+					OutErr = FString::Printf(TEXT("class '%s' is not allowed inside a particle import"), *ClassName);
+					return false;
+				}
+
+				TSharedPtr<FParticleTextNode> Node = MakeShareable(new FParticleTextNode());
+				Node->ClassName = ClassName;
+				Node->ObjectName = SubobjectName;
+				Node->ExportObjectName = ExportedObjectName.IsEmpty()
+					? SubobjectName : ExportedObjectName;
+				Node->ObjectClass = ObjectClass;
+				if (Stack.Num() > 0)
+				{
+					Node->Parent = Stack.Last().Get();
+					Stack.Last()->Children.Add(Node);
+				}
+				else
+				{
+					OutRoot = Node;
+				}
+				Stack.Add(Node);
+				++OutNodeCount;
+				continue;
+			}
+
+			if (IsParticleObjectDirective(Line, TEXT("End")))
+			{
+				if (Stack.Num() == 0)
+				{
+					OutErr = TEXT("particle T3D contains an unmatched End Object");
+					return false;
+				}
+				Stack.Pop();
+				continue;
+			}
+
+			if (Stack.Num() == 0)
+			{
+				OutErr = FString::Printf(TEXT("unexpected text outside ParticleSystem root: %s"), *Line);
+				return false;
+			}
+			if (!Line.StartsWith(TEXT("Name="))
+				&& !Line.StartsWith(TEXT("ObjName="))
+				&& !Line.StartsWith(TEXT("ObjectArchetype=")))
+			{
+				Stack.Last()->Properties.Add(Line);
+			}
+		}
+
+		if (Stack.Num() != 0 || !OutRoot.IsValid())
+		{
+			OutErr = TEXT("particle T3D has an unterminated or missing ParticleSystem root");
+			return false;
+		}
+		return true;
+	}
+
+	bool IndexCanonicalParticleModules(FParticleTextNode* Node, FParticleTextNode* Root,
+		TMap<FString, FParticleTextNode*>& OutModules, FString& OutErr)
+	{
+		if (Node != Root && ClassOrAncestorNamed(Node->ObjectClass, TEXT("ParticleModule")))
+		{
+			FParticleTextNode** Existing = OutModules.Find(Node->ExportObjectName);
+			if (Existing != nullptr)
+			{
+				if ((*Existing)->ObjectClass != Node->ObjectClass)
+				{
+					OutErr = FString::Printf(TEXT("particle module name '%s' is used by both %s and %s"),
+						*Node->ExportObjectName, *(*Existing)->ClassName, *Node->ClassName);
+					return false;
+				}
+				// UE3 exports the same module inline under its LOD and again at
+				// ParticleSystem scope. The root duplicate often omits the module's
+				// distribution subobjects, so prefer the definition that actually
+				// owns children. CreateParticleTextObjects still gives every selected
+				// module the ParticleSystem as its UE4 Outer. If both definitions are
+				// equally complete, the root copy remains the canonical one.
+				const bool bNodeHasChildren = Node->Children.Num() > 0;
+				const bool bExistingHasChildren = (*Existing)->Children.Num() > 0;
+				if ((bNodeHasChildren && !bExistingHasChildren)
+					|| (bNodeHasChildren == bExistingHasChildren
+						&& Node->Parent == Root && (*Existing)->Parent != Root))
+				{
+					*Existing = Node;
+				}
+			}
+			else
+			{
+				OutModules.Add(Node->ExportObjectName, Node);
+			}
+		}
+		for (const TSharedPtr<FParticleTextNode>& Child : Node->Children)
+		{
+			if (!IndexCanonicalParticleModules(Child.Get(), Root, OutModules, OutErr))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool IsCanonicalParticleNode(FParticleTextNode* Node,
+		const TMap<FString, FParticleTextNode*>& Modules)
+	{
+		if (!ClassOrAncestorNamed(Node->ObjectClass, TEXT("ParticleModule")))
+		{
+			return true;
+		}
+		FParticleTextNode* const* Canonical = Modules.Find(Node->ExportObjectName);
+		return Canonical != nullptr && *Canonical == Node;
+	}
+
+	bool CreateParticleTextObjects(FParticleTextNode* Node, UParticleSystem* Particle,
+		const TMap<FString, FParticleTextNode*>& Modules, int32& OutCreated, FString& OutErr)
+	{
+		if (Node->Parent == nullptr)
+		{
+			Node->CreatedObject = Particle;
+		}
+		else
+		{
+			if (!IsCanonicalParticleNode(Node, Modules))
+			{
+				return true; // skip the duplicate module and its duplicate distributions
+			}
+			UObject* Outer = (ClassOrAncestorNamed(Node->ObjectClass, TEXT("ParticleEmitter"))
+				|| ClassOrAncestorNamed(Node->ObjectClass, TEXT("ParticleModule")))
+				? (UObject*)Particle : Node->Parent->CreatedObject;
+			if (Outer == nullptr)
+			{
+				OutErr = FString::Printf(TEXT("could not resolve Outer for '%s'"), *Node->ObjectName);
+				return false;
+			}
+			UObject* Existing = StaticFindObjectFast(nullptr, Outer, FName(*Node->ObjectName));
+			if (Existing != nullptr)
+			{
+				// Particle-module constructors create their default distribution
+				// subobjects. Reuse those when the export names the same class/name.
+				if (Existing->GetClass() != Node->ObjectClass)
+				{
+					OutErr = FString::Printf(TEXT("object '%s' collides with existing class %s (wanted %s)"),
+						*Node->ObjectName, *Existing->GetClass()->GetName(), *Node->ClassName);
+					return false;
+				}
+				Node->CreatedObject = Existing;
+				Existing->SetFlags(RF_Transactional);
+			}
+			else
+			{
+				Node->CreatedObject = NewObject<UObject>(Outer, Node->ObjectClass,
+					FName(*Node->ObjectName), RF_Transactional);
+				if (Node->CreatedObject == nullptr)
+				{
+					OutErr = FString::Printf(TEXT("failed to create %s '%s'"),
+						*Node->ClassName, *Node->ObjectName);
+					return false;
+				}
+			}
+			++OutCreated;
+		}
+
+		for (const TSharedPtr<FParticleTextNode>& Child : Node->Children)
+		{
+			if (!CreateParticleTextObjects(Child.Get(), Particle, Modules, OutCreated, OutErr))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void FindParticleTextObjectByExportName(FParticleTextNode* Node, UClass* ReferenceClass,
+		UObject* ExpectedOuter, const FString& ReferenceName, UObject*& OutObject,
+		int32& OutMatches)
+	{
+		if (Node->CreatedObject != nullptr
+			&& Node->CreatedObject->GetOuter() == ExpectedOuter
+			&& Node->ObjectClass->IsChildOf(ReferenceClass)
+			&& Node->ExportObjectName == ReferenceName)
+		{
+			if (OutObject != Node->CreatedObject)
+			{
+				OutObject = Node->CreatedObject;
+				++OutMatches;
+			}
+		}
+		for (const TSharedPtr<FParticleTextNode>& Child : Node->Children)
+		{
+			FindParticleTextObjectByExportName(Child.Get(), ReferenceClass,
+				ExpectedOuter, ReferenceName, OutObject, OutMatches);
+		}
+	}
+
+	/** Convert every bare object reference in one exported property to the exact
+	    transient object path created by the first import pass. Unreal's property
+	    parser otherwise falls back to ANY_PACKAGE for names such as
+	    DistributionVectorConstantCurve_1, which can silently bind a module to an
+	    unrelated Cascade object already loaded in the editor. */
+	bool QualifyParticleLocalReferences(FParticleTextNode* Node, FString& InOutLine,
+		FString& OutErr)
+	{
+		int32 SearchFrom = 0;
+		while (SearchFrom < InOutLine.Len())
+		{
+			const int32 FirstQuote = InOutLine.Find(TEXT("'"), ESearchCase::CaseSensitive,
+				ESearchDir::FromStart, SearchFrom);
+			if (FirstQuote == INDEX_NONE)
+			{
+				break;
+			}
+			const int32 LastQuote = InOutLine.Find(TEXT("'"), ESearchCase::CaseSensitive,
+				ESearchDir::FromStart, FirstQuote + 1);
+			if (LastQuote == INDEX_NONE)
+			{
+				OutErr = FString::Printf(TEXT("unterminated object reference for %s '%s': %s"),
+					*Node->ClassName, *Node->ObjectName, *InOutLine);
+				return false;
+			}
+
+			int32 ClassStart = FirstQuote;
+			while (ClassStart > 0)
+			{
+				const TCHAR Ch = InOutLine[ClassStart - 1];
+				if (!FChar::IsAlnum(Ch) && Ch != TCHAR('_'))
+				{
+					break;
+				}
+				--ClassStart;
+			}
+			const FString ReferenceClassName = InOutLine.Mid(ClassStart,
+				FirstQuote - ClassStart);
+			const FString ReferenceText = InOutLine.Mid(FirstQuote + 1,
+				LastQuote - FirstQuote - 1);
+			UClass* ReferenceClass = ReferenceClassName.IsEmpty()
+				? nullptr : FindObject<UClass>(ANY_PACKAGE, *ReferenceClassName);
+
+			// A quote that is not preceded by a loaded UObject class belongs to a
+			// string property rather than Class'ObjectName' reference syntax.
+			if (ReferenceClass == nullptr || ReferenceText.IsEmpty())
+			{
+				SearchFrom = LastQuote + 1;
+				continue;
+			}
+			// Package-qualified references (notably the caller-validated material
+			// substitutions) are already deterministic.
+			if (ReferenceText.StartsWith(TEXT("/")))
+			{
+				SearchFrom = LastQuote + 1;
+				continue;
+			}
+
+			UObject* ReferencedObject = nullptr;
+			FParticleTextNode* Root = Node;
+			while (Root->Parent != nullptr)
+			{
+				Root = Root->Parent;
+			}
+			for (UObject* Scope = Node->CreatedObject; Scope != nullptr && ReferencedObject == nullptr;
+				Scope = Scope->GetOuter())
+			{
+				int32 AliasMatches = 0;
+				FindParticleTextObjectByExportName(Root, ReferenceClass, Scope,
+					ReferenceText, ReferencedObject, AliasMatches);
+				if (AliasMatches > 1)
+				{
+					OutErr = FString::Printf(
+						TEXT("ambiguous local %s reference '%s' for %s '%s': %s"),
+						*ReferenceClassName, *ReferenceText, *Node->ClassName,
+						*Node->ObjectName, *InOutLine);
+					return false;
+				}
+				if (ReferencedObject == nullptr)
+				{
+					ReferencedObject = StaticFindObjectFast(ReferenceClass, Scope,
+						FName(*ReferenceText));
+				}
+			}
+			if (ReferencedObject == nullptr)
+			{
+				OutErr = FString::Printf(
+					TEXT("could not resolve local %s reference '%s' for %s '%s': %s"),
+					*ReferenceClassName, *ReferenceText, *Node->ClassName,
+					*Node->ObjectName, *InOutLine);
+				return false;
+			}
+
+			const FString QualifiedPath = ReferencedObject->GetPathName();
+			InOutLine = InOutLine.Left(FirstQuote + 1) + QualifiedPath
+				+ InOutLine.Mid(LastQuote);
+			SearchFrom = FirstQuote + QualifiedPath.Len() + 2;
+		}
+		return true;
+	}
+
+	bool ImportParticleTextProperties(FParticleTextNode* Node, UParticleSystem* Particle,
+		const TMap<FString, FParticleTextNode*>& Modules, FString& OutErr)
+	{
+		if (!IsCanonicalParticleNode(Node, Modules))
+		{
+			return true;
+		}
+		// Children first means every distribution has its authored values before
+		// the parent module's raw-distribution wrapper is initialized.
+		for (const TSharedPtr<FParticleTextNode>& Child : Node->Children)
+		{
+			if (!ImportParticleTextProperties(Child.Get(), Particle, Modules, OutErr))
+			{
+				return false;
+			}
+		}
+		if (Node->CreatedObject == nullptr || Node->Properties.Num() == 0)
+		{
+			return Node->CreatedObject != nullptr;
+		}
+		// Cascade's InterpCurveEdSetup is editor-layout metadata, not runtime
+		// particle data. Its UE3 export stores bare curve-object names that can
+		// collide with hundreds of objects in a loaded UT4 editor. Keep the setup
+		// object so ParticleSystem::CurveEdSetup remains valid, but leave its tabs
+		// at defaults instead of accepting an arbitrary cross-package reference.
+		if (Node->ObjectClass->GetName() == TEXT("InterpCurveEdSetup"))
+		{
+			return true;
+		}
+
+		// ImportObjectProperties is declared publicly by UnrealEd in this fork but
+		// is not DLL-exported. ImportSingleProperty is the exported CoreUObject
+		// primitive used by that routine and is sufficient because object creation
+		// and nesting were handled in the first pass above.
+		TArray<FDefinedProperty> DefinedProperties;
+		const int32 PortFlags = PPF_Delimited | PPF_CheckReferences;
+		for (const FString& PropertyLine : Node->Properties)
+		{
+			FString QualifiedPropertyLine = PropertyLine;
+			if (!QualifyParticleLocalReferences(Node, QualifiedPropertyLine, OutErr))
+			{
+				return false;
+			}
+			const TCHAR* Result = UProperty::ImportSingleProperty(*QualifiedPropertyLine,
+				(uint8*)Node->CreatedObject, Node->CreatedObject->GetClass(),
+				Node->CreatedObject, PortFlags, GWarn, DefinedProperties);
+			if (Result == nullptr)
+			{
+				OutErr = FString::Printf(TEXT("Unreal rejected property for %s '%s': %s"),
+					*Node->ClassName, *Node->ObjectName, *PropertyLine);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** UE3 stored spawn rate/bursts on ParticleModuleRequired and commonly
+	    nested per-LOD modules under the LOD object. UE4.15 requires a separate
+	    ParticleModuleSpawn and expects every module's Outer to be the owning
+	    ParticleSystem. Normally PostLoad performs the spawn conversion for old
+	    binary packages; text-created objects never enter that load path. */
+	bool NormalizeLegacyParticleModules(UParticleSystem* Particle,
+		int32& OutSpawnModules, int32& OutRehomedModules, FString& OutErr)
+	{
+		OutSpawnModules = 0;
+		OutRehomedModules = 0;
+		auto Rehome = [Particle, &OutRehomedModules, &OutErr](UParticleModule* Module) -> bool
+		{
+			if (Module == nullptr || Module->GetOuter() == Particle)
+			{
+				return true;
+			}
+			FName NewName = Module->GetFName();
+			if (UObject* Clash = StaticFindObjectFast(nullptr, Particle, NewName))
+			{
+				if (Clash != Module)
+				{
+					NewName = MakeUniqueObjectName(Particle, Module->GetClass(), NewName);
+				}
+			}
+			if (!Module->Rename(*NewName.ToString(), Particle,
+				REN_DontCreateRedirectors | REN_NonTransactional | REN_ForceNoResetLoaders))
+			{
+				OutErr = FString::Printf(TEXT("could not rehome particle module '%s'"), *Module->GetPathName());
+				return false;
+			}
+			++OutRehomedModules;
+			return true;
+		};
+
+		for (UParticleEmitter* Emitter : Particle->Emitters)
+		{
+			if (Emitter == nullptr)
+			{
+				OutErr = TEXT("particle contains a null emitter");
+				return false;
+			}
+			for (UParticleLODLevel* Lod : Emitter->LODLevels)
+			{
+				if (Lod == nullptr || Lod->RequiredModule == nullptr)
+				{
+					OutErr = TEXT("particle emitter contains a null LOD or missing RequiredModule");
+					return false;
+				}
+				if (!Rehome(Lod->RequiredModule) || !Rehome(Lod->TypeDataModule))
+				{
+					return false;
+				}
+				for (UParticleModule* Module : Lod->Modules)
+				{
+					if (!Rehome(Module))
+					{
+						return false;
+					}
+				}
+
+				if (Lod->SpawnModule == nullptr)
+				{
+					UParticleModuleSpawn* Spawn = NewObject<UParticleModuleSpawn>(Particle,
+						MakeUniqueObjectName(Particle, UParticleModuleSpawn::StaticClass(), FName(TEXT("ParticleModuleSpawn"))));
+					if (Spawn == nullptr)
+					{
+						OutErr = TEXT("could not create UE4 spawn module for legacy LOD");
+						return false;
+					}
+					UDistributionFloat* LegacyRate = Lod->RequiredModule->SpawnRate.Distribution;
+					if (LegacyRate != nullptr)
+					{
+						UDistributionFloat* RateCopy = Cast<UDistributionFloat>(
+							StaticDuplicateObject(LegacyRate, Spawn));
+						if (RateCopy == nullptr)
+						{
+							OutErr = TEXT("could not duplicate legacy particle spawn-rate distribution");
+							return false;
+						}
+						RateCopy->bIsDirty = true;
+						Spawn->Rate.Distribution = RateCopy;
+						Spawn->Rate.Initialize();
+					}
+					Spawn->ParticleBurstMethod = Lod->RequiredModule->ParticleBurstMethod;
+					Spawn->BurstList = Lod->RequiredModule->BurstList;
+					Spawn->LODValidity = 1u << FMath::Clamp(Lod->Level, 0, 7);
+					Lod->SpawnModule = Spawn;
+					++OutSpawnModules;
+				}
+				else if (!Rehome(Lod->SpawnModule))
+				{
+					return false;
+				}
+				Lod->ConvertedModules = true;
+			}
+			Emitter->ConvertedModules = true;
+		}
+		return true;
+	}
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportParticleT3D(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	FString Source, Destination, NameArg;
+	if (!Args->TryGetStringField(TEXT("source"), Source) || Source.IsEmpty())
+	{
+		OutError = TEXT("missing 'source'");
+		return nullptr;
+	}
+	if (!Args->TryGetStringField(TEXT("destination"), Destination) || Destination.IsEmpty())
+	{
+		OutError = TEXT("missing 'destination'");
+		return nullptr;
+	}
+	Args->TryGetStringField(TEXT("name"), NameArg);
+	bool bOverwrite = false;
+	Args->TryGetBoolField(TEXT("overwrite"), bOverwrite);
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+
+	// Validate all filesystem/package input before constructing any UObject.
+	if (FPaths::IsRelative(Source))
+	{
+		OutError = TEXT("'source' must be an absolute path");
+		return nullptr;
+	}
+	if (!IFileManager::Get().FileExists(*Source))
+	{
+		OutError = FString::Printf(TEXT("source file not found: '%s'"), *Source);
+		return nullptr;
+	}
+	if (!FPaths::GetExtension(Source).Equals(TEXT("t3d"), ESearchCase::IgnoreCase))
+	{
+		OutError = TEXT("unsupported particle source (expected an object-text .t3d export)");
+		return nullptr;
+	}
+	const int64 SourceSize = IFileManager::Get().FileSize(*Source);
+	if (SourceSize <= 0 || SourceSize > 16 * 1024 * 1024)
+	{
+		OutError = TEXT("particle T3D must be between 1 byte and 16 MiB");
+		return nullptr;
+	}
+	if (!ValidContentDestination(Destination, OutError))
+	{
+		return nullptr;
+	}
+
+	FString AssetName = SanitizeMeshAssetName(NameArg.IsEmpty() ? FPaths::GetBaseFilename(Source) : NameArg);
+	if (AssetName.IsEmpty())
+	{
+		OutError = TEXT("asset name is empty after sanitization");
+		return nullptr;
+	}
+	FString DestFolder = Destination;
+	while (DestFolder.EndsWith(TEXT("/")))
+	{
+		DestFolder = DestFolder.LeftChop(1);
+	}
+	const FString PackagePath = DestFolder + TEXT("/") + AssetName;
+	const FString ObjectPath = PackagePath + TEXT(".") + AssetName;
+	if (!FPackageName::IsValidLongPackageName(PackagePath))
+	{
+		OutError = FString::Printf(TEXT("invalid target package '%s'"), *PackagePath);
+		return nullptr;
+	}
+
+	UObject* ExistingObject = LoadObject<UObject>(nullptr, *ObjectPath);
+	const bool bExists = ExistingObject != nullptr || FPackageName::DoesPackageExist(PackagePath);
+	if (bExists && !bOverwrite)
+	{
+		OutError = FString::Printf(TEXT("asset '%s' already exists (pass overwrite=true)"), *PackagePath);
+		return nullptr;
+	}
+	if (ExistingObject != nullptr && !ExistingObject->IsA<UParticleSystem>())
+	{
+		OutError = FString::Printf(TEXT("target '%s' exists but is not a ParticleSystem"), *ObjectPath);
+		return nullptr;
+	}
+
+	FString ParticleText;
+	if (!FFileHelper::LoadFileToString(ParticleText, *Source))
+	{
+		OutError = FString::Printf(TEXT("could not read particle T3D '%s'"), *Source);
+		return nullptr;
+	}
+
+	// Resolve and validate material substitutions up-front. Map keys are the
+	// legacy object paths in the T3D; values must be existing UT4 materials.
+	TSharedRef<FJsonObject> AppliedSubstitutions = MakeShareable(new FJsonObject());
+	int32 MaterialReplacementCount = 0;
+	const TSharedPtr<FJsonObject>* MaterialsPtr = nullptr;
+	if (Args->TryGetObjectField(TEXT("materials"), MaterialsPtr)
+		&& MaterialsPtr != nullptr && MaterialsPtr->IsValid())
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*MaterialsPtr)->Values)
+		{
+			if (!Pair.Value.IsValid() || Pair.Value->Type != EJson::String)
+			{
+				OutError = FString::Printf(TEXT("material mapping '%s' must have a string value"), *Pair.Key);
+				return nullptr;
+			}
+			const FString LegacyPath = BareExportObjectPath(Pair.Key);
+			const FString TargetObjectPath = NormalizeObjectPath(Pair.Value->AsString());
+			UMaterialInterface* TargetMaterial = LoadObject<UMaterialInterface>(nullptr, *TargetObjectPath);
+			if (TargetMaterial == nullptr)
+			{
+				OutError = FString::Printf(TEXT("could not load mapped material '%s' for '%s'"),
+					*Pair.Value->AsString(), *Pair.Key);
+				return nullptr;
+			}
+			const FString LegacyToken = TEXT("'") + LegacyPath + TEXT("'");
+			const FString TargetToken = TEXT("'") + TargetMaterial->GetPathName() + TEXT("'");
+			const int32 Replaced = ParticleText.ReplaceInline(*LegacyToken, *TargetToken, ESearchCase::CaseSensitive);
+			if (Replaced > 0)
+			{
+				AppliedSubstitutions->SetStringField(LegacyPath, TargetMaterial->GetPathName());
+				MaterialReplacementCount += Replaced;
+			}
+		}
+	}
+
+	// A legacy dotted package cannot resolve in UE4. Refuse a silent default
+	// material: every surviving Material='...' line must name a loadable
+	// /Game or /Engine object after substitution.
+	TArray<FString> MaterialPaths;
+	TArray<FString> TextLines;
+	ParticleText.ParseIntoArrayLines(TextLines, false);
+	for (const FString& RawLine : TextLines)
+	{
+		FString Line = RawLine;
+		Line = Line.Trim();
+		Line = Line.TrimTrailing();
+		if (!Line.StartsWith(TEXT("Material=")))
+		{
+			continue;
+		}
+		const int32 FirstQuote = Line.Find(TEXT("'"));
+		const int32 LastQuote = Line.Find(TEXT("'"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		if (FirstQuote == INDEX_NONE || LastQuote <= FirstQuote)
+		{
+			continue; // Material=None is valid.
+		}
+		const FString Ref = Line.Mid(FirstQuote + 1, LastQuote - FirstQuote - 1);
+		if (!Ref.StartsWith(TEXT("/Game/")) && !Ref.StartsWith(TEXT("/Engine/")))
+		{
+			OutError = FString::Printf(TEXT("legacy material '%s' has no substitution"), *Ref);
+			return nullptr;
+		}
+		const FString RefObjectPath = NormalizeObjectPath(Ref);
+		if (LoadObject<UMaterialInterface>(nullptr, *RefObjectPath) == nullptr)
+		{
+			OutError = FString::Printf(TEXT("particle material '%s' could not be loaded"), *Ref);
+			return nullptr;
+		}
+		MaterialPaths.AddUnique(RefObjectPath);
+	}
+
+	TSharedPtr<FParticleTextNode> ParsedTextRoot;
+	int32 SourceObjectCount = 0;
+	if (!ParseParticleObjectText(ParticleText, ParsedTextRoot, SourceObjectCount, OutError))
+	{
+		return nullptr;
+	}
+	TMap<FString, FParticleTextNode*> CanonicalModules;
+	if (!IndexCanonicalParticleModules(ParsedTextRoot.Get(), ParsedTextRoot.Get(), CanonicalModules, OutError))
+	{
+		return nullptr;
+	}
+
+	// Build into a transient ParticleSystem first. The two-pass tree importer
+	// constructs every allow-listed object before assigning references, keeps
+	// all particle modules at UE4's required ParticleSystem Outer, and suppresses
+	// PostEditChange until legacy spawn data has been translated. A malformed
+	// export therefore cannot crash Cascade or evict an existing target asset.
+	const FName TempName = MakeUniqueObjectName(GetTransientPackage(), UParticleSystem::StaticClass(), FName(TEXT("MapForgeParticleImport")));
+	UParticleSystem* Parsed = NewObject<UParticleSystem>(GetTransientPackage(), TempName, RF_Transactional);
+	Parsed->PreEditChange(nullptr);
+	int32 CreatedObjectCount = 1; // the transient ParticleSystem root
+	if (!CreateParticleTextObjects(ParsedTextRoot.Get(), Parsed, CanonicalModules,
+		CreatedObjectCount, OutError)
+		|| !ImportParticleTextProperties(ParsedTextRoot.Get(), Parsed, CanonicalModules, OutError))
+	{
+		TrashObject(Parsed);
+		return nullptr;
+	}
+	int32 ConvertedSpawnModules = 0;
+	int32 RehomedModules = 0;
+	if (!NormalizeLegacyParticleModules(Parsed, ConvertedSpawnModules, RehomedModules, OutError))
+	{
+		TrashObject(Parsed);
+		return nullptr;
+	}
+	Parsed->UpdateAllModuleLists();
+	Parsed->SetupSoloing();
+	Parsed->PostEditChange();
+	if (Parsed->Emitters.Num() == 0)
+	{
+		TrashObject(Parsed);
+		OutError = TEXT("particle import produced zero emitters");
+		return nullptr;
+	}
+	for (UParticleEmitter* Emitter : Parsed->Emitters)
+	{
+		if (Emitter == nullptr || Emitter->LODLevels.Num() == 0)
+		{
+			TrashObject(Parsed);
+			OutError = TEXT("particle import produced a null emitter or an emitter with no LOD levels");
+			return nullptr;
+		}
+	}
+
+	const FScopedTransaction Transaction(FText::FromString(TEXT("MapForge Import Particle T3D")));
+	UPackage* Package = CreatePackage(nullptr, *PackagePath);
+	if (Package == nullptr)
+	{
+		TrashObject(Parsed);
+		OutError = FString::Printf(TEXT("could not create package '%s'"), *PackagePath);
+		return nullptr;
+	}
+	Package->FullyLoad();
+	if (UObject* Existing = StaticFindObjectFast(nullptr, Package, FName(*AssetName)))
+	{
+		TrashObject(Existing);
+	}
+
+	UParticleSystem* Particle = Cast<UParticleSystem>(
+		StaticDuplicateObject(Parsed, Package, FName(*AssetName)));
+	TrashObject(Parsed);
+	if (Particle == nullptr)
+	{
+		OutError = TEXT("failed to duplicate parsed ParticleSystem into the target package");
+		return nullptr;
+	}
+	Particle->SetFlags(RF_Public | RF_Standalone | RF_Transactional);
+	Particle->UpdateAllModuleLists();
+	Particle->SetupSoloing();
+	Particle->PostEditChange();
+	Particle->MarkPackageDirty();
+	FAssetRegistryModule::AssetCreated(Particle);
+	const bool bSaved = bSave ? SaveAssetPackage(Particle) : false;
+
+	TArray<TSharedPtr<FJsonValue>> Emitters;
+	int32 LodCount = 0;
+	int32 ModuleCount = 0;
+	for (UParticleEmitter* Emitter : Particle->Emitters)
+	{
+		TSharedRef<FJsonObject> EmitterJson = MakeShareable(new FJsonObject());
+		EmitterJson->SetStringField(TEXT("name"), Emitter->EmitterName.IsNone()
+			? Emitter->GetName() : Emitter->EmitterName.ToString());
+		EmitterJson->SetNumberField(TEXT("lods"), Emitter->LODLevels.Num());
+		int32 EmitterModules = 0;
+		for (UParticleLODLevel* Lod : Emitter->LODLevels)
+		{
+			if (Lod != nullptr)
+			{
+				EmitterModules += Lod->Modules.Num();
+			}
+		}
+		EmitterJson->SetNumberField(TEXT("modules"), EmitterModules);
+		LodCount += Emitter->LODLevels.Num();
+		ModuleCount += EmitterModules;
+		Emitters.Add(MakeShareable(new FJsonValueObject(EmitterJson)));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ResolvedMaterials;
+	for (const FString& Path : MaterialPaths)
+	{
+		ResolvedMaterials.Add(MakeShareable(new FJsonValueString(Path)));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Particle->GetPathName());
+	Result->SetStringField(TEXT("package"), Particle->GetOutermost()->GetName());
+	Result->SetStringField(TEXT("class"), Particle->GetClass()->GetName());
+	Result->SetStringField(TEXT("source"), Source);
+	Result->SetStringField(TEXT("destination"), DestFolder);
+	Result->SetBoolField(TEXT("created"), !bExists);
+	Result->SetBoolField(TEXT("overwritten"), bExists);
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	Result->SetNumberField(TEXT("source_object_count"), SourceObjectCount);
+	Result->SetNumberField(TEXT("created_object_count"), CreatedObjectCount);
+	Result->SetNumberField(TEXT("canonical_module_count"), CanonicalModules.Num());
+	Result->SetNumberField(TEXT("emitter_count"), Particle->Emitters.Num());
+	Result->SetNumberField(TEXT("lod_count"), LodCount);
+	Result->SetNumberField(TEXT("module_count"), ModuleCount);
+	Result->SetNumberField(TEXT("converted_spawn_modules"), ConvertedSpawnModules);
+	Result->SetNumberField(TEXT("rehomed_modules"), RehomedModules);
+	Result->SetNumberField(TEXT("material_replacement_count"), MaterialReplacementCount);
+	Result->SetObjectField(TEXT("material_substitutions"), AppliedSubstitutions);
+	Result->SetArrayField(TEXT("resolved_materials"), ResolvedMaterials);
+	Result->SetArrayField(TEXT("emitters"), Emitters);
+	return Result;
 }
 
 TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdImportStaticMesh(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
@@ -3489,6 +4481,164 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdSetMaterialParams(UWorld* Worl
 	Result->SetObjectField(TEXT("applied_scalars"), AppliedScalars);
 	Result->SetObjectField(TEXT("applied_vectors"), AppliedVectors);
 	Result->SetArrayField(TEXT("warnings"), Warnings);
+	Result->SetBoolField(TEXT("saved"), bSaved);
+	return Result;
+}
+
+TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdSetMaterialCameraFade(UWorld* World, const TSharedRef<FJsonObject>& Args, FString& OutError)
+{
+	// Injects: <input> *= clamp((distance(CameraWS, ObjectWS) - fade_start) / fade_length, 0, 1)
+	// into every CONNECTED EmissiveColor / Opacity / OpacityMask input of a
+	// BASE material. Built for screen-space decals whose projection volume can
+	// contain the camera (the bio-goo full-screen tint): within fade_start of
+	// the decal origin the material contributes nothing. Re-running updates the
+	// constants on the previously injected chain (marker-tagged) instead of
+	// stacking another multiply.
+	UMaterialInterface* MatInterface = LoadMaterialArg(Args, OutError);
+	if (MatInterface == nullptr)
+	{
+		return nullptr;
+	}
+	UMaterial* Material = Cast<UMaterial>(MatInterface);
+	if (Material == nullptr)
+	{
+		OutError = FString::Printf(TEXT("'%s' is a %s; camera fade edits the BASE material graph"),
+			*MatInterface->GetPathName(), *MatInterface->GetClass()->GetName());
+		return nullptr;
+	}
+
+	double FadeStart = 180.0;
+	double FadeLength = 120.0;
+	Args->TryGetNumberField(TEXT("fade_start"), FadeStart);
+	Args->TryGetNumberField(TEXT("fade_length"), FadeLength);
+	if (FadeLength <= 0.0)
+	{
+		OutError = TEXT("'fade_length' must be > 0");
+		return nullptr;
+	}
+	bool bSave = true;
+	Args->TryGetBoolField(TEXT("save"), bSave);
+
+	static const FString MarkerDesc(TEXT("MapForge camera-distance fade"));
+
+	// Update path: constants live on the Subtract (fade_start) and Divide
+	// (fade_length) behind any marker-tagged multiply.
+	int32 UpdatedChains = 0;
+	for (UMaterialExpression* Expr : Material->Expressions)
+	{
+		UMaterialExpressionMultiply* Marked = Cast<UMaterialExpressionMultiply>(Expr);
+		if (Marked == nullptr || Marked->Desc != MarkerDesc)
+		{
+			continue;
+		}
+		UMaterialExpressionClamp* Sat = Cast<UMaterialExpressionClamp>(Marked->B.Expression);
+		UMaterialExpressionDivide* Div = Sat != nullptr ? Cast<UMaterialExpressionDivide>(Sat->Input.Expression) : nullptr;
+		UMaterialExpressionSubtract* Sub = Div != nullptr ? Cast<UMaterialExpressionSubtract>(Div->A.Expression) : nullptr;
+		if (Div != nullptr && Sub != nullptr)
+		{
+			Sub->ConstB = (float)FadeStart;
+			Div->ConstB = (float)FadeLength;
+			++UpdatedChains;
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> AppliedInputs;
+	if (UpdatedChains == 0)
+	{
+		// The shared distance factor, built once. CameraPositionWS /
+		// ObjectPositionWS / Distance are plain UCLASS() in 4.15 (not even
+		// MinimalAPI) -- their StaticClass symbol is not exported, so they are
+		// constructed via the runtime class registry and cast by definition
+		// (the K2Node_* lesson: never link what the registry already has).
+		UClass* CameraClass = FindObject<UClass>(ANY_PACKAGE, TEXT("MaterialExpressionCameraPositionWS"));
+		UClass* OriginClass = FindObject<UClass>(ANY_PACKAGE, TEXT("MaterialExpressionObjectPositionWS"));
+		UClass* DistClass = FindObject<UClass>(ANY_PACKAGE, TEXT("MaterialExpressionDistance"));
+		if (CameraClass == nullptr || OriginClass == nullptr || DistClass == nullptr)
+		{
+			OutError = TEXT("material-expression classes missing from the class registry");
+			return nullptr;
+		}
+		UMaterialExpressionCameraPositionWS* Camera = (UMaterialExpressionCameraPositionWS*)NewObject<UMaterialExpression>(Material, CameraClass);
+		UMaterialExpressionObjectPositionWS* Origin = (UMaterialExpressionObjectPositionWS*)NewObject<UMaterialExpression>(Material, OriginClass);
+		UMaterialExpressionDistance* Dist = (UMaterialExpressionDistance*)NewObject<UMaterialExpression>(Material, DistClass);
+		UMaterialExpressionSubtract* Sub = NewObject<UMaterialExpressionSubtract>(Material);
+		UMaterialExpressionDivide* Div = NewObject<UMaterialExpressionDivide>(Material);
+		UMaterialExpressionClamp* Sat = NewObject<UMaterialExpressionClamp>(Material);
+		Dist->A.Expression = Camera;
+		Dist->B.Expression = Origin;
+		Sub->A.Expression = Dist;
+		Sub->ConstB = (float)FadeStart;
+		Div->A.Expression = Sub;
+		Div->ConstB = (float)FadeLength;
+		Sat->Input.Expression = Div;
+		Sat->MinDefault = 0.f;
+		Sat->MaxDefault = 1.f;
+
+		// Rough editor layout left of the graph so the injected chain is
+		// visible/selectable when the material is opened.
+		UMaterialExpression* Chain[] = { Camera, Origin, Dist, Sub, Div, Sat };
+		for (int32 Index = 0; Index < ARRAY_COUNT(Chain); ++Index)
+		{
+			Chain[Index]->MaterialExpressionEditorX = -1400 + Index * 170;
+			Chain[Index]->MaterialExpressionEditorY = 700 + (Index % 2) * 90;
+			Material->Expressions.Add(Chain[Index]);
+		}
+
+		// One marker-tagged multiply per connected target input; unconnected
+		// inputs are left alone (wiring a fade into an unused pin would CHANGE
+		// the material's output).
+		struct FTarget { const TCHAR* Name; FExpressionInput* Input; };
+		FTarget Targets[] = {
+			{ TEXT("emissive"),     &Material->EmissiveColor },
+			{ TEXT("opacity"),      &Material->Opacity },
+			{ TEXT("opacity_mask"), &Material->OpacityMask },
+		};
+		for (const FTarget& Target : Targets)
+		{
+			if (Target.Input->Expression == nullptr)
+			{
+				continue;
+			}
+			UMaterialExpressionMultiply* Mult = NewObject<UMaterialExpressionMultiply>(Material);
+			Mult->Desc = MarkerDesc;
+			// Preserve the existing wiring (expression + output index + mask)
+			// as multiply input A, then repoint the material input at the
+			// multiply's own (unmasked) output.
+			Mult->A = *Target.Input;
+			Mult->B.Expression = Sat;
+			Mult->MaterialExpressionEditorX = Target.Input->Expression->MaterialExpressionEditorX + 200;
+			Mult->MaterialExpressionEditorY = Target.Input->Expression->MaterialExpressionEditorY;
+			Material->Expressions.Add(Mult);
+
+			Target.Input->Expression = Mult;
+			Target.Input->OutputIndex = 0;
+			Target.Input->Mask = 0;
+			Target.Input->MaskR = 0;
+			Target.Input->MaskG = 0;
+			Target.Input->MaskB = 0;
+			Target.Input->MaskA = 0;
+			AppliedInputs.Add(MakeShareable(new FJsonValueString(Target.Name)));
+		}
+
+		if (AppliedInputs.Num() == 0)
+		{
+			OutError = TEXT("no connected emissive/opacity/opacity_mask inputs to attenuate");
+			return nullptr;
+		}
+	}
+
+	Material->PreEditChange(nullptr);
+	Material->PostEditChange();
+	Material->MarkPackageDirty();
+	const bool bSaved = bSave ? SaveAssetPackage(Material) : false;
+
+	TSharedRef<FJsonObject> Result = MakeShareable(new FJsonObject());
+	Result->SetStringField(TEXT("asset"), Material->GetPathName());
+	Result->SetNumberField(TEXT("fade_start"), FadeStart);
+	Result->SetNumberField(TEXT("fade_length"), FadeLength);
+	Result->SetArrayField(TEXT("applied_inputs"), AppliedInputs);
+	Result->SetNumberField(TEXT("updated_existing_chains"), UpdatedChains);
+	Result->SetNumberField(TEXT("expression_count"), Material->Expressions.Num());
 	Result->SetBoolField(TEXT("saved"), bSaved);
 	return Result;
 }

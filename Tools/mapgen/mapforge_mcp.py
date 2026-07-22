@@ -395,6 +395,20 @@ def bridge_compile_blueprint(asset: str) -> dict:
 
 
 @mcp.tool()
+def bridge_reparent_blueprint(asset: str, new_parent: str) -> dict:
+    """Reparent a Blueprint to a new parent class, recompile, and save.
+    'new_parent' resolves like create_blueprint's parent: a native class name
+    ("UTWeap_Minigun_Plus"), a /Script/ path, or a BP asset path (uses its
+    generated class); abstract native parents are valid. Refuses inheritance
+    cycles. Returns {asset, old_parent, new_parent, changed, status, ok,
+    messages, saved}. Property values that existed only on the OLD parent
+    chain are dropped by the recompile -- OBJ DUMP before/after when the two
+    parents' defaults diverge (identical-default swaps like stock -> *_Plus
+    are safe)."""
+    return _bridge_call("reparent_blueprint", {"asset": asset, "new_parent": new_parent})
+
+
+@mcp.tool()
 def bridge_export_graph(asset: str, graph: str = "", save_to: str = "") -> dict:
     """Export a Blueprint graph as clipboard-text T3D -- the read-back half of
     the loop and the way to capture graph fixtures from a real Blueprint.
@@ -477,6 +491,33 @@ def bridge_import_static_mesh(source: str, destination: str = "", name: str = ""
     if root:
         args["recovery_root"] = root
     return _bridge_call("import_static_mesh", args)
+
+
+@mcp.tool()
+def bridge_import_particle_t3d(source: str, destination: str, name: str = "",
+                               materials: dict = None, overwrite: bool = False,
+                               save: bool = True) -> dict:
+    """Import a Cascade ParticleSystem exported as object-text T3D into the
+    open editor. This is intentionally narrower than a generic object importer:
+    the root must be ParticleSystem and every nested object must be a standard
+    particle emitter/LOD/module/distribution (plus Cascade's curve editor data).
+    'source' must be an absolute .t3d path; 'destination' is a /Game folder.
+    'materials' maps legacy object paths to existing UT4 material paths, e.g.
+    {"WP_RocketLauncher.Materials.M_FireTrail": "/Game/.../M_Rocket_TrailFire"}.
+    Every legacy material reference must be mapped before import. Existing
+    assets fail unless overwrite=True. Returns emitter names/counts, applied
+    substitutions, and save state; it never saves the current map."""
+    args = {
+        "source": source,
+        "destination": destination,
+        "overwrite": overwrite,
+        "save": save,
+    }
+    if name:
+        args["name"] = name
+    if materials:
+        args["materials"] = materials
+    return _bridge_call("import_particle_t3d", args)
 
 
 @mcp.tool()
@@ -617,6 +658,22 @@ def bridge_inspect_static_mesh_actors(name_contains: str = "", folder_contains: 
     return _bridge_call("inspect_static_mesh_actors", {
         "name_contains": name_contains, "folder_contains": folder_contains,
         "offset": offset, "limit": limit})
+
+
+@mcp.tool()
+def bridge_set_material_camera_fade(asset: str, fade_start: float = 180.0,
+                                    fade_length: float = 120.0, save: bool = True) -> dict:
+    """Inject a camera-distance attenuation into a BASE material's graph:
+    every connected emissive/opacity/opacity-mask output is multiplied by
+    clamp((distance(camera, object origin) - fade_start) / fade_length, 0, 1),
+    so the material contributes nothing when the camera is within fade_start
+    units of the object/decal origin. Built for screen-space decals whose
+    projection box can swallow the camera (the bio-goo full-screen tint).
+    Re-running with new values UPDATES the previously injected chain
+    (marker-tagged) instead of stacking. save=True writes the .uasset.
+    Requires a UMaterial (not an instance). Returns applied inputs + counts."""
+    return _bridge_call("set_material_camera_fade", {
+        "asset": asset, "fade_start": fade_start, "fade_length": fade_length, "save": save})
 
 
 @mcp.tool()
