@@ -397,14 +397,21 @@ def bridge_compile_blueprint(asset: str) -> dict:
 @mcp.tool()
 def bridge_reparent_blueprint(asset: str, new_parent: str) -> dict:
     """Reparent a Blueprint to a new parent class, recompile, and save.
+
+    *** MUTATOR / GAMEMODE (no instanced default-subobjects) ONLY. ***
+    HARD-REFUSED (ok=false) for UTWeapon/UTProjectile-derived BPs: a headless
+    recompile reinstances their CreateDefaultSubobject state machine
+    (StateActive/StateEquipping/...) with a broken Outer -> fatal "created in
+    Package instead of <Class>" assert that crashed a live editor 2026-07-21.
+    Reparent those in the editor UI (Class Settings -> Parent Class) instead.
+
     'new_parent' resolves like create_blueprint's parent: a native class name
-    ("UTWeap_Minigun_Plus"), a /Script/ path, or a BP asset path (uses its
-    generated class); abstract native parents are valid. Refuses inheritance
-    cycles. Returns {asset, old_parent, new_parent, changed, status, ok,
-    messages, saved}. Property values that existed only on the OLD parent
-    chain are dropped by the recompile -- OBJ DUMP before/after when the two
-    parents' defaults diverge (identical-default swaps like stock -> *_Plus
-    are safe)."""
+    ("AUTMutator"), a /Script/ path, or a BP asset path (uses its generated
+    class); abstract native parents are valid. Refuses inheritance cycles.
+    Returns {asset, old_parent, new_parent, changed, status, ok, messages,
+    saved}. Property values that existed only on the OLD parent chain are
+    dropped by the recompile -- OBJ DUMP before/after when parents' defaults
+    diverge."""
     return _bridge_call("reparent_blueprint", {"asset": asset, "new_parent": new_parent})
 
 

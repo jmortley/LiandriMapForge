@@ -2082,6 +2082,38 @@ TSharedPtr<FJsonObject> FMapForgeBridgeServer::CmdReparentBlueprint(UWorld* Worl
 		OutError = FString::Printf(TEXT("class '%s' cannot be a Blueprint parent"), *NewParent->GetName());
 		return nullptr;
 	}
+	// SAFETY GATE (2026-07-21): a headless reparent (RefreshAllNodes +
+	// CompileBlueprint) fatally crashes the editor on classes that own instanced
+	// default-subobjects created in the C++ constructor — UTWeapon's weapon-state
+	// machine (StateActive/StateEquipping/...) and UTProjectile — because the CDO
+	// reinstance re-parents those subobjects into the transient Package
+	// ("created in Package instead of <Class>" assert). The editor's own
+	// Reparent Blueprint menu does the extra reinstancing these need. Until this
+	// verb replicates that flow, hard-refuse the fragile families (checked by
+	// class NAME so no UnrealTournament module dependency is pulled in), on BOTH
+	// the old and new parent chains.
+	auto ChainHasFragileBase = [](UClass* Start) -> const TCHAR*
+	{
+		for (UClass* C = Start; C != nullptr; C = C->GetSuperClass())
+		{
+			const FString N = C->GetName();
+			if (N == TEXT("UTWeapon"))     return TEXT("UTWeapon");
+			if (N == TEXT("UTProjectile")) return TEXT("UTProjectile");
+		}
+		return nullptr;
+	};
+	const TCHAR* FragileOld = ChainHasFragileBase(Blueprint->ParentClass);
+	const TCHAR* FragileNew = ChainHasFragileBase(NewParent);
+	if (FragileOld != nullptr || FragileNew != nullptr)
+	{
+		OutError = FString::Printf(
+			TEXT("refusing to reparent a %s-derived Blueprint headlessly — it would ")
+			TEXT("crash the editor (instanced default-subobject reinstance). Reparent ")
+			TEXT("'%s' in the editor UI (Class Settings -> Parent Class) instead."),
+			FragileOld ? FragileOld : FragileNew, *Blueprint->GetName());
+		return nullptr;
+	}
+
 	// Refuse cycles: reparenting onto yourself or one of your own children.
 	if (Blueprint->GeneratedClass != nullptr &&
 		(NewParent == Blueprint->GeneratedClass || NewParent->IsChildOf(Blueprint->GeneratedClass)))
