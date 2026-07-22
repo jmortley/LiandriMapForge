@@ -83,6 +83,8 @@ elimplus layout PNG ──(vision)──▶ MapSpec (JSON) ──(emit.py)──
   - `forge_chassis_physasset` — duplicate-and-strip a skeletal mesh's `UPhysicsAsset` to a clean chassis-only asset (UTVehicles `PhysicsAssetOverride`)
   - **Blueprint authoring Tier 1** — `create_blueprint` a subclass of `AUTMutator`/`AUTGameMode` + `set_class_defaults` (CDO overrides): the config-variant path, no graph
   - **Blueprint authoring Tier 2** — `add_variable` + `import_graph` (clipboard-text) + `compile_blueprint` + `export_graph`: real graph logic, seeded by re-homing a graph captured from a shipped BP
+  - **Blueprint lifecycle** — `duplicate_asset` + `reparent_blueprint`: copy a live BP and migrate it to a new (e.g. native `*_Plus`) parent without touching the editor UI — the NetcodePlus weapon-migration workflow
+  - **Sounds, materials, particles** — `import_sound`/`create_sound_cue` (UTVehicles audio), `set_material_params`/`set_material_camera_fade`/`inspect_material`, `import_particle_t3d` (allow-listed Cascade import), `configure_skeletal_mesh`
 - [ ] Emitter authoring for goo POOLS (`UTPainVolume`) + functional lifts (`Generic_Lift_C`) — the bridge imports both correctly (verified against `capture/deck.t3d` blocks); MapSpec/emit.py just can't author them yet
 - [ ] Verticality + weapons — jump pads, lifts, `WeaponBase_C` + ammo (serialization captured from a real map)
 - [ ] **Layout → MapSpec vision step** (elimplus PNG → structured spec)
@@ -107,9 +109,13 @@ The verbs span three areas: **level editing** (`import_t3d`/`export_t3d`/
 `rebuild_geometry`/`build`/`save_level`/`set_surface_material`/`list_actors`/
 `delete_actors`/`place_static_mesh`), **asset authoring** (`forge_chassis_physasset`
 physics assets; `create_blueprint`/`set_class_defaults`/`add_variable`/`import_graph`/
-`compile_blueprint`/`export_graph` for Blueprint mutators & gamemodes;
-`import_static_mesh`/`configure_static_mesh` for meshes), and the restricted
-`exec` escape hatch. Asset-authoring verbs touch packages, not the level.
+`compile_blueprint`/`reparent_blueprint`/`export_graph` for Blueprint mutators &
+gamemodes; `import_static_mesh`/`configure_static_mesh`/`configure_skeletal_mesh`
+for meshes; `import_sound`/`create_sound_cue` for audio; `set_material_params`/
+`set_material_camera_fade`/`inspect_material` for materials;
+`import_particle_t3d` for Cascade systems; `duplicate_asset` for anything), and
+the restricted `exec` escape hatch. Asset-authoring verbs touch packages, not
+the level.
 
 | Verb | What it does |
 |---|---|
@@ -129,12 +135,21 @@ physics assets; `create_blueprint`/`set_class_defaults`/`add_variable`/`import_g
 | `add_variable` | `FBlueprintEditorUtils::AddMemberVariable` — scalar/object/class/struct types (+`[]`); needed before importing a graph that references the var by self-context |
 | `import_graph` | `FEdGraphUtilities::ImportNodesFromText` into the event/function graph + the editor's post-paste fix-up. **Tier-2 graph authoring** (clipboard-text) |
 | `compile_blueprint` | `CompileBlueprint` + node-level error/warning report (`bHasCompilerMessage`/`ErrorType`/`ErrorMsg`); import success ≠ validity, so always compile |
+| `reparent_blueprint` | swap a Blueprint's parent class (same `ResolveClass`/`CanCreateBlueprintOfClass` gate as `create_blueprint`; abstract native parents valid; cycles refused), then the editor's own reparent flow: `RefreshAllNodes` → mark modified → recompile → save, returning old/new parent + the `compile_blueprint` diagnostics. Values that existed only on the old parent chain are dropped — dump before/after when parent defaults diverge (identical-default swaps like stock → `*_Plus` are safe) |
 | `export_graph` | `FEdGraphUtilities::ExportNodesToText` of a graph — read-back + the way to capture graph fixtures from a real Blueprint |
 | `import_static_mesh` | import a `.obj`/`.fbx` as a `UStaticMesh` via the automated `UFbxFactory` (no dialog, no Exec); static-mesh-only, no materials by default, combine on; configures collision + lightmap + returns full mesh stats. `.obj`/`.fbx` only — never `.umap`/packages |
 | `configure_static_mesh` | set collision mode, clear simple collision, lightmap UV channel, and assign materials to explicit slots on an imported mesh; optional per-asset save |
 | `place_static_mesh` | spawn a `AStaticMeshActor` for a mesh into the current level at a transform (identity default), with label/folder; undoable, marks level dirty + redraws, **never saves the level** |
+| `configure_skeletal_mesh` | inspect or reassign a `USkeletalMesh`'s material slots — no `materials` arg = read-only slot listing that never dirties the asset; slots/paths validated before anything is applied |
+| `import_sound` | import one 16-bit mono/stereo PCM WAV as a `USoundWave` (no dialog); optional native loop flag; existing assets fail cleanly unless `overwrite` |
+| `create_sound_cue` | build a modal-free `USoundCue` graph from imported SoundWave paths — single/random/mix modes, looping, volume/pitch, optional modulator + per-input mixer volumes |
+| `set_material_params` | set scalar/vector parameter overrides on a `UMaterialInstanceConstant` (persists, unlike runtime MID edits); HDR vector values allowed; params the root master doesn't expose still apply but are flagged in `warnings` |
+| `set_material_camera_fade` | inject/update a camera-distance attenuation multiply on a **base** material's connected emissive/opacity outputs — the material contributes nothing within `fade_start` units (built for screen-space decals) |
+| `import_particle_t3d` | import a Cascade `ParticleSystem` object-text T3D into a new asset — allow-listed: root must be a ParticleSystem and every nested object a standard emitter/LOD/module/distribution (never a generic object importer) |
+| `duplicate_asset` | duplicate any asset into a new package via `StaticDuplicateObject` + save — the safe copy-then-modify entry point (used for the `UTNPMinigun` weapon-migration copy) |
 | `recovery_layout` | **read-only**: resolve the canonical map-scoped recovery layout (content paths under `<RecoveryRoot>/<MapSlug>/…` + on-disk Saved paths) for a `map_name` (inferred from the current map, recovery suffixes stripped, when omitted). Sanitizes the slug, rejects traversal/`/Engine`/invalid roots. Not in `IsMutatingCmd` |
 | `inspect_static_mesh_actors` | **read-only** audit of every `StaticMeshActor` in the current level: mesh-or-null, actor + component transform, hidden/visible, mobility, collision, material overrides by slot, plus summary counts. Name/folder filters, offset/limit. Excludes pending-kill; **never dirties the map**. Not in `IsMutatingCmd` |
+| `inspect_material` | **read-only**: material/instance class, parent chain up to the root master, current scalar/vector/texture overrides, and every root-exposed parameter with the value the queried asset actually resolves to. Not in `IsMutatingCmd` |
 
 Limits: 4 clients, 64 MiB per request line, bounded per-tick socket work — a
 wedged or hostile local client gets dropped, never a frozen editor. Regression
